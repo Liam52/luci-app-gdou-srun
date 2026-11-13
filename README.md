@@ -449,13 +449,15 @@ logread | grep gdou-srun
 
 ```
 luci-app-gdou-srun/
-├── Makefile                              # OpenWrt 包定义（PKG_VERSION 3.0.0）
+├── Makefile                              # OpenWrt 包定义（PKG_VERSION 3.1.0）
 ├── install.sh                            # 免编译安装脚本
 ├── tools/
 │   └── make-single-file.sh               # 生成自包含单文件安装器
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE                               # GPL-3.0
+├── docs/
+│   └── case-lan-hotplug-auth-loss.md     # 案例：电脑开关机掉认证
 ├── .gitignore / .gitattributes
 └── files/
     ├── etc/
@@ -579,4 +581,4 @@ rm -rf /tmp/luci-indexcache* && /etc/init.d/rpcd restart
 
 ---
 
-**当前版本**：3.0.0 · 见 [CHANGELOG.md](CHANGELOG.md) 了解每个版本的改动。
+**当前版本**：3.1.0 · 见 [CHANGELOG.md](CHANGELOG.md) 了解每个版本的改动。

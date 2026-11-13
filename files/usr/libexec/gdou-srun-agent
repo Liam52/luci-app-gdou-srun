@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 LIBEXEC = "/usr/libexec"
@@ -171,6 +172,8 @@ class Agent:
         self.last_rx = -1
         self.last_rx_t = 0
         self.renew_fail = 0
+        self._bg = {}
+        self.offline_since = 0
 
     # ---------- 状态翻转 ----------
     def set_state(self, new, why=""):
@@ -231,6 +234,9 @@ class Agent:
             return
 
         # ---- 离线 ----
+        if self.state != "offline":
+            # 记住第一次判定离线的时刻：链路抖动（1~2 秒）不该立刻触发登录
+            self.offline_since = now
         self.set_state("offline", "探测未通过")
         self.after_offline(cfg)
         time.sleep(PROBE_OFFLINE)
@@ -313,6 +319,16 @@ class Agent:
         now = time.time()
         if now < self.next_login:
             return
+
+        # 冷却闸门：离线时间不足 login_cooldown 秒就先不动。
+        # 旧 shell 守护进程就是这么做的——链路抖动 1~2 秒不会触发重新认证，
+        # 而「一抖动就登录」正是之前被门户 BAS 限流的直接原因。
+        try:
+            cooldown = int(cfg.get("login_cooldown") or 10)
+        except (TypeError, ValueError):
+            cooldown = 10
+        if now - self.offline_since < cooldown:
+            return
         self.set_state("authing", "准备登录")
         ok, out, err = run("gdou-srun", ["login"], timeout=150)
         detail = (out or err)[-220:]
@@ -336,17 +352,47 @@ class Agent:
 
     # ---------- 周期同步 ----------
     def sync_all(self, cfg):
-        # 多链路（脚本内部按配置算计划，幂等）
-        ok, out, err = run("gdou-srun-dual", ["sync"], timeout=180)
-        if not ok and (out or err):
-            log("dual_sync_failed", detail=(out or err)[-160:])
+        """周期性同步：多链路 / 分流 / IPv6。
 
-        # 分流（幂等，规则没变就不动）
-        ok, out, err = run("gdou-srun-split", ["sync"], timeout=180)
-        if not ok and (out or err):
-            log("split_sync_failed", detail=(out or err)[-160:])
+        两个要点（对齐旧 shell 守护进程的行为）：
+        1. 多链路只在真的用到时才同步（advanced / dual / mcv0 存在），
+           否则每次白跑一遍 plan，没意义。
+        2. 同步放到后台线程执行，不要阻塞探测循环——同步里可能等 DHCP、
+           等登录，最长几分钟；一旦阻塞，断线检测就停了。
+        """
+        adv = cfg.get("advanced") == "1"
+        dualc = cfg.get("dual_same_account") == "1"
+        has_mcv = os.path.exists("/sys/class/net/mcv0")
+
+        if adv or dualc or has_mcv:
+            self._spawn("dual", lambda: self._run_sync("gdou-srun-dual", "dual_sync_failed"))
+
+        smode = cfg.get("split_mode") or "backup"
+        if smode != "off" and has_mcv:
+            self._spawn("split", lambda: self._run_sync("gdou-srun-split", "split_sync_failed"))
 
         self.sync_ipv6(cfg)
+
+    def _spawn(self, name, fn):
+        """起一个后台线程干活；同名线程还在跑就跳过这一轮。"""
+        if name in self._bg:
+            return
+        th = threading.Thread(target=self._bg_wrap, args=(name, fn), daemon=True)
+        self._bg[name] = th
+        th.start()
+
+    def _bg_wrap(self, name, fn):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            log("sync_error", which=name, msg=str(exc)[:120])
+        finally:
+            self._bg.pop(name, None)
+
+    def _run_sync(self, script, tag):
+        ok, out, err = run(script, ["sync"], timeout=180)
+        if not ok and (out or err):
+            log(tag, detail=(out or err)[-160:])
 
     # ---------- IPv6 三档 ----------
     def sync_ipv6(self, cfg):
@@ -402,7 +448,7 @@ class Agent:
 
     # ---------- 启动 ----------
     def run_forever(self):
-        log("boot", version="3.0.0-agent", pid=os.getpid())
+        log("boot", version="3.1.0-agent", pid=os.getpid())
         while True:
             try:
                 self.tick()
