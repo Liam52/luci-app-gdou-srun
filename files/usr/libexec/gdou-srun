@@ -22,6 +22,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -166,15 +167,40 @@ def placeholder_hint(cfg):
     return ""
 
 
-def save_acids(last_good, manual=None):
-    """把 ac_id 写回 uci，下次启动直接用。"""
+ACID_STATE = os.environ.get("GDOU_ACID_STATE", "/tmp/gdou-srun.acid")
+
+
+def load_saved_acids():
+    """读取上次成功的 ac_id（存 /tmp，不写 uci）。
+
+    早期版本把 ac_id 写回 uci，问题是：
+      1. 每次登录成功都要 uci commit，也就是每次登录写一次 flash；
+      2. 多个脚本并发 uci set/commit 时，uci 不是并发安全的，
+         会把 /etc/config/gdou-srun 写坏（实测丢过十几项配置）。
+    改存 /tmp 后两个问题一起消失；重启后重新发现 ac_id 也只要 1~2 秒。
+    """
     try:
-        if last_good:
-            os.system("uci set gdou-srun.gdou_srun.last_good_acid='%d'" % last_good)
-        if manual is not None:
-            os.system("uci set gdou-srun.gdou_srun.manual_acid='%s'" % (manual or ""))
-        os.system("uci commit gdou-srun")
-    except Exception:  # noqa: BLE001
+        with open(ACID_STATE, "r", encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_acids(last_good, manual=None):
+    """记住这次成功的 ac_id，下次启动优先用它。
+
+    只写 /tmp 下的状态文件，不碰 uci：uci 在并发写入时会写坏配置，
+    而且 commit 会写 flash，登录成功一次写一次并不合适。
+    """
+    data = load_saved_acids()
+    if isinstance(last_good, int) and last_good > 0:
+        data["last_good"] = last_good
+    if manual is not None and str(manual).strip().isdigit():
+        data["manual"] = str(manual).strip()
+    try:
+        with open(ACID_STATE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+    except OSError:
         pass
 
 
@@ -480,9 +506,10 @@ def candidates(cfg):
         if v > 0 and all(v != item[0] for item in order):
             order.append((v, source))
 
-    add(cfg.get("manual_acid"), "手动")
+    saved = load_saved_acids()
+    add(saved.get("manual") or cfg.get("manual_acid"), "手动")
     add(discovered, "重定向获取")
-    add(cfg.get("last_good_acid"), "上次成功")
+    add(saved.get("last_good") or cfg.get("last_good_acid"), "上次成功")
     add(cfg.get("acid"), "配置值")
     return order
 

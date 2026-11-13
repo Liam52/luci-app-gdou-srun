@@ -250,11 +250,19 @@ def mode_dev():
 
 
 def persist(mode):
-    """把模式写进 uci。否则手动切换会被守护进程下一轮 sync 用旧值覆盖回去。"""
+    """把模式写进 uci。否则手动切换会被守护进程下一轮 sync 用旧值覆盖回去。
+
+    uci 的 set/commit 不是并发安全的：和其它脚本同时写入会把配置文件写坏
+    （实测丢过十几项配置），所以这里用文件锁串行化。
+    """
     try:
-        subprocess.run(["uci", "set", "gdou-srun.gdou_srun.split_mode=%s" % mode],
-                       capture_output=True, timeout=10)
-        subprocess.run(["uci", "commit", "gdou-srun"], capture_output=True, timeout=10)
+        import fcntl
+        with open("/tmp/gdou-uci.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            subprocess.run(["uci", "set", "gdou-srun.gdou_srun.split_mode=%s" % mode],
+                           capture_output=True, timeout=10)
+            subprocess.run(["uci", "commit", "gdou-srun"], capture_output=True, timeout=10)
+            fcntl.flock(lock, fcntl.LOCK_UN)
     except Exception:  # noqa: BLE001
         pass
 

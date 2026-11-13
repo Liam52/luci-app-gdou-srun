@@ -69,7 +69,11 @@ pool_build() {
 
 	[ -z "$(uci -q get "$KEY.mac_origin")" ] && uci set "$KEY.mac_origin=$(cur_mac)"
 	uci set "$KEY.mac_pool=$list"
-	uci commit gdou-srun
+	# uci 不是并发安全的：和别处的 set/commit 撞车会把配置文件写坏
+	(
+		flock 9
+		uci commit gdou-srun
+	) 9>/tmp/gdou-uci.lock
 	echo "$list"
 }
 

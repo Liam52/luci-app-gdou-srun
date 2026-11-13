@@ -21,6 +21,17 @@ reload_service() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger "gdou-srun"
-	procd_add_interface_trigger "interface.*" "*" /etc/init.d/gdou-srun reload
+	# 这里刻意不注册任何自动触发器，原因有两条：
+	#
+	# 1. 曾经有 procd_add_interface_trigger "interface.*" "*"
+	#    —— 任何接口事件（含 LAN 侧电脑开关机的 DHCP 变化）都会重启进程并重新认证，
+	#    短时间内多次认证会被门户 BAS 限流，表现为「电脑开关机就掉认证」。
+	#
+	# 2. 曾经有 procd_add_reload_trigger "gdou-srun"
+	#    —— 只要 uci 配置 commit 就重启服务，而插件登录成功后会写回 ac_id，
+	#    等于每次登录成功都把自己重启一次。
+	#
+	# 守护进程每 5 秒重读一次配置，接口恢复也会在 3~10 秒内自行发现，
+	# 完全不需要事件触发。需要立即生效时用「立即重连」按钮或 /etc/init.d/gdou-srun restart。
+	:
 }

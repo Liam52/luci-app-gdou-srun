@@ -1,9 +1,25 @@
 #!/bin/sh
-# 接口上线时立刻尝试一次认证，不必等后台循环。
+# WAN 接口上线时立刻尝试一次认证，不必等守护进程的探测周期。
+#
+# 注意：这里必须只针对 WAN。早期版本没有过滤接口，导致局域网里任何设备
+# （电脑开关机、手机连 WiFi）引起的 ifup 都会触发一次登录，
+# 短时间内多次认证会被门户 BAS 限流，表现为「电脑一开关机就掉认证」。
 
 [ "$ACTION" = "ifup" ] || exit 0
+
+# 只认 WAN 接口
+case "$INTERFACE" in
+	wan|wan6) ;;
+	*) exit 0 ;;
+esac
+
 enabled=$(uci -q get gdou-srun.gdou_srun.enabled)
 [ "$enabled" = "0" ] && exit 0
 
-( sleep 3; /usr/libexec/gdou-srun login >/dev/null 2>&1 ) &
+# 已经在线就不要重复登录（避免和守护进程撞车）
+( sleep 3
+  /usr/libexec/gdou-srun check >/dev/null 2>&1 && exit 0
+  /usr/libexec/gdou-srun login >/dev/null 2>&1
+) &
+
 exit 0

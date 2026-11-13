@@ -1,3 +1,26 @@
+## [3.0.0] - 2026-11-14
+
+定位为 3.0 主要是因为**运行时结构变了**：守护进程从 shell 循环改为常驻 Python 进程，
+`ac_id` 的持久化从 uci 移到状态文件，界面三页全部重做。
+
+### 主要变化（相对 2.x）
+
+- **常驻守护进程**：单进程内循环探测，CPU 从单核 18.7% 降到约 1.3%，
+  一天从约 3.5 小时降到 20 分钟左右。
+- **界面三页重做**：首页压成 3 块（状态 / 账号+操作 / 链路+设备），
+  设置页改为「常用 + 进阶折叠」，多链路页分区重排；抽出共用 `ui.css`（约 16 KB），
+  状态呼吸灯、卡片阴影、按钮微交互、深浅色自适应。
+- **认证稳定性**：修掉「电脑开关机就掉认证」（接口触发器 + 热插拔双重触发导致被门户限流）、
+  守护进程自我重启、并发 uci 写坏配置文件三个问题。
+- **诊断包**：断网时可正常下载（232 秒 → 11 秒），结果同时落盘 `/tmp/gdou-diag.txt`。
+- **`ac_id` 持久化**：改存 `/tmp/gdou-srun.acid`，登录不再写 flash，也不再和别的脚本抢 uci。
+
+### 升级注意
+
+- 从 2.x 升级：配置结构不变，但建议检查一次 `/etc/config/gdou-srun` 是否完整
+  （2.x 存在并发写坏配置的缺陷，可能已丢项）。
+- 3.0 起 `last_good_acid` / `manual_acid` 不再写回 uci，界面里看到的静态值仅供参考。
+
 # 更新日志
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
@@ -125,6 +148,58 @@
 - **分流模式 `backup`**：主链路掉线时整段切到虚拟链路，作为网络备份。
 
 ### 修复
+
+- **「电脑开关机就掉认证」**（实测定位）：`/etc/init.d/gdou-srun` 里有一条
+  `procd_add_interface_trigger "interface.*" "*"`，任何接口事件都会重启守护进程；
+  同时 `/etc/hotplug.d/iface/90-gdou-srun` 对**任何**接口的 `ifup` 都会触发一次登录。
+  PC 开机/关机时 LAN 侧 DHCP 变化会同时踩中这两条 → 短时间内多次认证 →
+  校园网 BAS 对该 MAC/IP 限流 → `CHALLENGE failed, BAS respond timeout` → 掉认证。
+  实测：换一个 MAC（拿到新 IP）立刻能登上，坐实是「被限流」而非账号问题。
+
+  修复：
+  - `init.d` 移除 interface 触发器，只在配置变更时重载（守护进程自己每 3~10 秒探测）
+  - `hotplug` 只对 `wan` / `wan6` 生效，并且先 `check`，已在线就跳过
+  - 守护进程区分「网络不通」和「门户 BAS 限流」，后者用 30/60/120/300 秒的长退避
+
+- **断网时「下载诊断包」超时失败**：诊断脚本里用 `wget -T 4` 探测门户，
+  但 busybox 的 `-T` 不限制 TCP 连接阶段，断网时内核 SYN 重试会拖到 100 秒以上，
+  实测最坏 **232 秒**，前端 `fs.exec` 早就超时了。修复：
+
+  | 改动 | 效果 |
+  |---|---|
+  | 门户探测改用 `python3 urllib`（硬 4 秒超时） | 断网 232s → 11s |
+  | 去掉重复的 `gdou-srun check`（它内部串行做三次探测，最多 13 秒） | 少一轮网络等待 |
+  | 收包采样 5s → 3s | 少 2 秒 |
+  | 结果同时写 `/tmp/gdou-diag.txt`，前端 exec 超时改读文件 | 双保险 |
+
+  实测：在线 7 秒，模拟断网 11 秒。
+
+- **潜在问题排查与修复**（同类隐患一次性清理）：
+  - `gdou-srun-agent`：断网且配置了虚拟链路时，原来每 3 秒起一个子进程查状态，
+    等于又变成「每 3 秒 fork 一次 python」。改为 30 秒节流。
+  - `gdou-srun` 的 `save_acids()`：用 `os.system` 字符串拼接写 uci，无超时且
+    有引号注入风险；改为 `subprocess` 列表参数 + 8 秒超时，并且只接受纯数字。
+  - `gdou-srun-devices`：`shell=True` 拼接接口名，可能被注入；新增 `safe_dev()`
+    白名单校验（只允许 `[A-Za-z0-9_.@-]`）。
+  - `Makefile`：新增 `postinst` 补 `chmod 755`——Windows 上 git 不记录可执行位，
+    从源码构建的 opkg 会装出 644 脚本。
+  - `install.sh`：配置补齐列表原来漏了 `ipv6_mode`、`renew_gap`、`mac_*`、
+    `server`、`acid` 等十余项，从 1.x 升级的用户会缺字段；现已补全。
+
+- **配置文件被写坏（严重）**：`/etc/config/gdou-srun` 曾丢失 `server`、`interval`、
+  `ipv6_mode`、`renew_*`、`mac_*` 等十余项，只剩 25 项。原因是 **uci 的 set/commit
+  不是并发安全的**——插件在三条路径同时写同一个配置文件：
+
+  | 写入方 | 触发时机 |
+  |---|---|
+  | `gdou-srun` 登录成功 | 每次登录写 `last_good_acid` |
+  | `gdou-srun-mac` | 换 MAC 时写 `mac_origin` / `mac_pool` |
+  | `gdou-srun-split` | 手动切分流模式时写 `split_mode` |
+
+  修复：
+  - `ac_id` 不再写 uci，改存 `/tmp/gdou-srun.acid`（顺带解决「每次登录写一次 flash」）
+  - `gdou-srun-mac`、`gdou-srun-split` 的 commit 用 `flock` 串行化
+  - 重启后重新发现 ac_id 只需 1~2 秒，不依赖持久化
 
 - **`gdou-srun-mac` 改 MAC 后重启失效**：部分固件在 `/etc/config/network` 里用
   `config device` 段固定网口 MAC，优先级高于 interface 上的 `macaddr`。

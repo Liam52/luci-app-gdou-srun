@@ -290,7 +290,7 @@ procd 启动
 
 1. **手动指定**（填了就只用它）
 2. **门户劫持跳转里读出来的值** —— 未认证时访问 http 站点会被劫持到门户，跳转 URL 里带着本次连接真实的 `ac_id`
-3. **上次成功的值**（成功后自动写回 UCI 的 `last_good_acid`）
+3. **上次成功的值**（成功后记在 `/tmp/gdou-srun.acid`，重启后重新发现也只要 1~2 秒）
 4. **兜底值**（默认 25）
 
 ## 失败处理
@@ -449,7 +449,7 @@ logread | grep gdou-srun
 
 ```
 luci-app-gdou-srun/
-├── Makefile                              # OpenWrt 包定义（PKG_VERSION 2.2.0）
+├── Makefile                              # OpenWrt 包定义（PKG_VERSION 3.0.0）
 ├── install.sh                            # 免编译安装脚本
 ├── tools/
 │   └── make-single-file.sh               # 生成自包含单文件安装器
@@ -487,6 +487,17 @@ luci-app-gdou-srun/
 **运行时依赖**：`python3-light`、`python3-urllib`、`python3-hashlib`、`python3-email`。
 `gdou-srun`、`gdou-srun-agent`、`gdou-srun-dual`、`gdou-srun-split`、`gdou-srun-devices` 是 Python；
 其余是 POSIX shell。
+
+### 提交前注意（Windows 用户）
+
+Windows 上 `git` 默认不记录可执行位，`files/usr/libexec/` 下的脚本推上去会变成 644，
+别人从源码构建 opkg 时会装出「不可执行」的脚本。提交前执行一次：
+
+```sh
+git update-index --chmod=+x files/usr/libexec/* files/etc/init.d/* files/etc/hotplug.d/iface/*
+```
+
+Makefile 里已经加了 `postinst` 兜底（装完补 chmod 755），但仓库本身的权限也建议设对。
 
 ## 参与开发
 
@@ -568,4 +579,4 @@ rm -rf /tmp/luci-indexcache* && /etc/init.d/rpcd restart
 
 ---
 
-**当前版本**：2.2.0 · 见 [CHANGELOG.md](CHANGELOG.md) 了解每个版本的改动。
+**当前版本**：3.0.0 · 见 [CHANGELOG.md](CHANGELOG.md) 了解每个版本的改动。

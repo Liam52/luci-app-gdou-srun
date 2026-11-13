@@ -39,13 +39,29 @@ mkdir -p "$ROOT/etc/config" "$ROOT/etc/init.d" "$ROOT/etc/hotplug.d/iface" \
 if [ -f "$ROOT/etc/config/gdou-srun" ]; then
 	say "==> 已存在 /etc/config/gdou-srun，保留现有配置（只补缺失字段）"
 	cp -f "$ROOT/etc/config/gdou-srun" "/tmp/gdou-srun.config.bak.$(date +%s)"
-	# 仅补齐新版本新增的选项，不动已有值
-	for opt in advanced auto_apply dual_same_account split_mode \
-	           sub1_enabled sub1_dual sub2_enabled sub2_dual sub3_enabled sub3_dual; do
+	# 补齐当前版本用到的全部选项：只补缺失的，已存在的值一律不动
+	for kv in \
+		server=http://10.129.1.1 acid=25 manual_acid= last_good_acid= \
+		test_host=www.baidu.com test_port=80 \
+		interval=1 login_cooldown=10 auto_agree=1 \
+		ipv6_mode=off portal_os=HarmonyOS portal_name=Huawei \
+		advanced=0 auto_apply=0 dual_same_account=0 split_mode=backup \
+		renew_enable=1 renew_gap=5 \
+		mac_refresh=0 mac_mode=pool mac_gap=300 mac_origin= \
+		sub1_enabled=0 sub1_dual=0 sub2_enabled=0 sub2_dual=0 \
+		sub3_enabled=0 sub3_dual=0 \
+		sub1_username= sub1_password= sub2_username= sub2_password= \
+		sub3_username= sub3_password=; do
+		opt=${kv%%=*}
+		val=${kv#*=}
 		if ! uci -q get "gdou-srun.gdou_srun.$opt" >/dev/null 2>&1; then
-			uci set "gdou-srun.gdou_srun.$opt=0" 2>/dev/null || true
+			uci set "gdou-srun.gdou_srun.$opt=$val" 2>/dev/null || true
 		fi
 	done
+	# 时刻列表含空格，单独处理
+	if ! uci -q get gdou-srun.gdou_srun.renew_times >/dev/null 2>&1; then
+		uci set "gdou-srun.gdou_srun.renew_times=0500 1300 2000" 2>/dev/null || true
+	fi
 	uci commit gdou-srun 2>/dev/null || true
 else
 	say "==> 写入默认配置"

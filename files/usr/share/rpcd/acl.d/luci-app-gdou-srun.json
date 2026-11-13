@@ -11,6 +11,9 @@
     ],
     "/tmp/gdou-dual.log": [
      "read"
+    ],
+    "/tmp/gdou-diag.txt": [
+     "read"
     ]
    },
    "uci": [
