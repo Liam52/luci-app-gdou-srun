@@ -226,10 +226,10 @@ uci commit gdou-srun
 页面顶部一个窗口（每 10 秒自动刷新，也可手动「刷新」）：一个大数字 + 一张表。
 
 ```
-  1  台设备在线（学校侧统计）        移动-12个月套餐 · 本机 10.155.236.89
+  1  台设备在线（学校侧统计）        移动-12个月套餐 · 本机 10.155.236.100
 
   IP              系统        设备类别   会话 ID
-  10.155.236.89    HarmonyOS   Huawei    114927073   [本机]
+  10.155.236.100    HarmonyOS   Huawei    123456789   [本机]
 ```
 
 **这才是真正决定你会不会被踢的数字。** 套餐限制同时在线设备数，超了就会把旧会话顶下线；路由器后面挂多少台设备都不计入。数据来自 `rad_user_info` 的 `online_device_total` 与 `online_device_detail`。
@@ -352,7 +352,7 @@ uci commit gdou-srun && /etc/init.d/gdou-srun restart
 **12 秒内连不上就自动退回原始 MAC**，并输出：
 
 ```json
-{"ok": false, "reason": "port_security", "restored_to": "80:af:ca:b1:42:72",
+{"ok": false, "reason": "port_security", "restored_to": "aa:bb:cc:dd:ee:ff",
  "msg": "换 MAC 后门户不可达，已自动恢复原始 MAC"}
 ```
 
@@ -363,7 +363,7 @@ uci commit gdou-srun && /etc/init.d/gdou-srun restart
 > `config device` + `option name 'eth0'` + `option macaddr` 段——**它的优先级高于 interface 上的 `macaddr`**。
 > v2.0.0 起插件会同时写这两处，`gdou-srun-mac show` 也会把 device 段的值显示出来。
 
-> **⚠️ `carrier` 不能用来判断网线是否插好**：部分板子（如 MT7981 + 外部 RTL822x 2.5G PHY）
+> **⚠️ `carrier` 不能用来判断网线是否插好**：部分板子（如某些 MT798x + 外置 2.5G PHY 的方案）
 > 的 `eth0` 是 `fixed/2500base-x` 固定链路，**MAC 侧 carrier 永远显示 1**，跟网线插没插无关。
 > 判断链路是否真的通，要看 `rx_packets` 在几秒内是否增长，或者直接看 DHCP 有没有拿到地址。
 > `gdou-srun-diag` 会自动识别这种硬件并在输出里标注。

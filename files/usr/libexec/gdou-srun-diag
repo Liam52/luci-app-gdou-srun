@@ -15,7 +15,7 @@ g() { uci -q get "$KEY.$1"; }
 
 hr() { echo "------------------------------------------------------------"; }
 
-# 有些板子（如 MT7981 + RTL822x 外部 2.5G PHY）的 eth0 是 fixed/2500base-x 链路，
+# 有些板子（某些 MT798x + 外置 2.5G PHY 方案）的 eth0 是 fixed/2500base-x 链路，
 # MAC 侧永远 display carrier=1，跟网线插没插完全无关。这种情况下不能拿 carrier 判断。
 FIXED_LINK=0
 dmesg 2>/dev/null | grep -q "fixed/.*base-x" && FIXED_LINK=1
