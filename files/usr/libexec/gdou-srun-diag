@@ -98,6 +98,13 @@ r1=$(cat /sys/class/net/eth0/statistics/rx_packets 2>/dev/null || echo 0)
 sleep 3
 r2=$(cat /sys/class/net/eth0/statistics/rx_packets 2>/dev/null || echo 0)
 echo "收包活性 : eth0 3 秒内 +$((r2 - r1)) 包"
+ldn=$(dmesg 2>/dev/null | grep -c "eth0: Link is Down")
+lup=$(dmesg 2>/dev/null | grep -c "eth0: Link is Up")
+echo "链路翻转 : 本次启动 Link Down ${ldn} 次 / Up ${lup} 次"
+if [ "${ldn:-0}" -gt 3 ]; then
+	echo "           ** 翻转偏多：多半是供电波动（和电脑共用插排）或网线/墙口接触不良 **"
+	echo "           ** 频繁翻转会让校园交换机判定端口异常，可能导致认证掉线 **"
+fi
 if [ $((r2 - r1)) -gt 0 ]; then
 	echo "           链路有数据进来（正常）"
 elif [ "$FIXED_LINK" = "1" ]; then

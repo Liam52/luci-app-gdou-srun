@@ -329,23 +329,53 @@ return view.extend({
 						out.textContent = label + ' ' + what + ' 中…（约 10~30 秒）';
 					}
 
-					fs.exec('/usr/libexec/gdou-srun-dual', [op, iface]).then(function (res) {
-						var text = ((res && res.stdout) || '').trim() ||
-							((res && res.stderr) || '').trim() || '（无输出）';
+					/* 长操作走「后台启动 + 轮询」：
+					 * ubus 的 file exec 没有 timeout 参数，rpcd 会一直等到命令结束。
+					 * 换 MAC/IP 要换 MAC、重等 DHCP、再认证，常常 30~60 秒，
+					 * 直接 fs.exec 会先被前端 XHR 超时打断（表现为 Error: XHR request timed out）。 */
+					function finish(ok, text) {
 						if (out) {
-							out.textContent = label + ' ' + what + ' 完成：' + text;
-							out.style.color = text.indexOf('"ok": true') >= 0 ? '#2e7d32' : '#c62828';
+							out.textContent = label + ' ' + what + (ok ? ' 完成：' : ' 失败：') + text;
+							out.style.color = ok ? '#2e7d32' : '#c62828';
 						}
-						refreshLinks();
-						refresh();
-					}).catch(function (err) {
-						if (out) {
-							out.textContent = label + ' ' + what + ' 失败：' + err;
-							out.style.color = '#c62828';
-						}
-					}).finally(function () {
 						btn.textContent = old;
 						Array.prototype.forEach.call(all, function (x) { x.disabled = false; });
+						refreshLinks();
+						refresh();
+					}
+
+					if (out) {
+						out.style.color = '';
+						out.textContent = label + ' ' + what + ' 已提交，后台执行中…';
+					}
+
+					fs.exec('/usr/libexec/gdou-srun-dual', ['opstart', op, iface]).then(function () {
+						var tries = 0;
+						function poll() {
+							tries++;
+							fs.exec('/usr/libexec/gdou-srun-dual', ['opstatus']).then(function (r) {
+								var st = null;
+								try { st = JSON.parse(((r && r.stdout) || '').trim()); } catch (e) { st = null; }
+								if (st && st.running === false && st.ok !== null && st.ok !== undefined) {
+									finish(st.ok === true, JSON.stringify(st).slice(0, 300));
+									return;
+								}
+								if (tries > 60) {
+									finish(false, '等待超时（后台可能仍在执行，稍后刷新看看）');
+									return;
+								}
+								if (out) {
+									out.textContent = label + ' ' + what + ' 中… 已等待 ' + (tries * 2) + ' 秒';
+								}
+								setTimeout(poll, 2000);
+							}).catch(function () {
+								if (tries > 60) { finish(false, '状态查询失败'); return; }
+								setTimeout(poll, 2000);
+							});
+						}
+						setTimeout(poll, 1500);
+					}).catch(function (err) {
+						finish(false, String(err));
 					});
 				});
 			}
