@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""输出当前连接的设备列表（单行 JSON），供 LuCI 页面渲染。
+
+数据来源全部是路由器本机现成的信息，不依赖任何外部工具：
+  /tmp/dhcp.leases        → IP、MAC、主机名、租期
+  bridge fdb show br-lan  → MAC 挂在哪个接口（eth1 有线 / ra0 2.4G / rax0 5G）
+  ip neigh                → 邻居状态，辅助判断在线
+  10.129.1.1 rad_user_info → 门户侧看到的会话（账号下几台在线）
+
+用法：
+  gdou-srun-devices          打印 JSON
+  gdou-srun-devices --pretty 缩进输出，便于排查
+"""
+import json
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+LEASES = "/tmp/dhcp.leases"
+BRIDGE = "br-lan"
+PORTAL = "http://10.129.1.1"
+
+IFACE_LABEL = {
+    "eth1": "有线",
+    "ra0": "WiFi 2.4G",
+    "rax0": "WiFi 5G",
+}
+
+
+def sh(cmd, timeout=6):
+    """跑一条命令，失败返回空串（设备列表不该因为某条命令失败而整体崩掉）。"""
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout)
+        return p.stdout or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def read_leases():
+    """解析 DHCP 租约：<过期时间戳> <MAC> <IP> <主机名> <clientid>"""
+    out = []
+    try:
+        with open(LEASES, "r", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                try:
+                    expire = int(parts[0])
+                except ValueError:
+                    continue
+                mac = parts[1].lower()
+                ip = parts[2]
+                host = parts[3] if len(parts) > 3 else "*"
+                out.append({"mac": mac, "ip": ip,
+                            "host": "" if host in ("*", "") else host,
+                            "expire": expire})
+    except OSError:
+        pass
+    return out
+
+
+def read_fdb():
+    """bridge fdb → {mac: 接口名}，跳过 permanent/self 这类本地条目。"""
+    res = {}
+    for line in sh("bridge fdb show br %s" % BRIDGE).splitlines():
+        f = line.split()
+        if len(f) < 3:
+            continue
+        mac = f[0].lower()
+        if not re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac):
+            continue
+        if "permanent" in f or "self" in f:
+            continue
+        dev = ""
+        for i, tok in enumerate(f):
+            if tok == "dev" and i + 1 < len(f):
+                dev = f[i + 1]
+                break
+        if dev:
+            res[mac] = dev
+    return res
+
+
+def read_neigh():
+    """ip neigh → {mac: {"ip": 地址, "state": 状态}}"""
+    res = {}
+    for line in sh("ip neigh show dev %s" % BRIDGE).splitlines():
+        f = line.split()
+        if not f:
+            continue
+        state = f[-1]
+        mac = ""
+        for i, tok in enumerate(f):
+            if tok == "lladdr" and i + 1 < len(f):
+                mac = f[i + 1].lower()
+                break
+        if mac:
+            res[mac] = {"ip": f[0], "state": state}
+    return res
+
+
+def human_lease(expire, now):
+    if expire <= 0:
+        return "永久"
+    left = expire - now
+    if left <= 0:
+        return "已过期"
+    if left >= 3600:
+        h = left // 3600
+        m = (left % 3600) // 60
+        return "%dh%02dm" % (h, m)
+    return "%dm" % max(1, left // 60)
+
+
+def wan_ip():
+    """本机 WAN 地址，用来在门户设备列表里标出哪台是这台路由器。"""
+    dev = ""
+    try:
+        with open("/tmp/.gdou_wan_dev") as fh:
+            dev = fh.read().strip()
+    except OSError:
+        dev = ""
+    if not dev:
+        dev = (sh("uci -q get network.wan.device").strip() or "eth0")
+    out = sh("ip -4 addr show dev %s" % dev)
+    m = re.search(r"inet ([0-9.]+)/", out)
+    return m.group(1) if m else ""
+
+
+def http_portal(ip=None, timeout=6):
+    """查门户会话；可指定源 IP（绑定到某条已认证链路）。"""
+    url = "%s/cgi-bin/rad_user_info?%s" % (
+        PORTAL, urllib.parse.urlencode({"callback": "sdu", "_": str(int(time.time()))}))
+    if not ip:
+        req = urllib.request.Request(url, headers={"User-Agent": "gdou-srun-devices"})
+        return urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+
+    # 走指定源 IP：用底层 socket 绑定后手写 HTTP，避免 urllib 不支持 source_address
+    host = urllib.parse.urlparse(PORTAL).hostname
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.bind((ip, 0))
+        s.connect((host, 80))
+        s.sendall(("GET /cgi-bin/rad_user_info?callback=sdu&_=%d HTTP/1.0\r\n"
+                   "Host: %s\r\nConnection: close\r\n\r\n" % (int(time.time()), host)).encode())
+        raw = b""
+        while len(raw) < 8192:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+        return raw.decode("utf-8", "replace")
+    finally:
+        s.close()
+
+
+def parse_portal(body):
+    m = re.search(r"\((.*)\)\s*$", body.strip())
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def fetch_portal():
+    """读门户的在线设备明细；失败返回空结构，不影响局域网列表。
+
+    注意：从主链路自己的 IP 查自己，门户会回 not_online_error（即使确实在线），
+    所以这里先查一次，不行就换成绑定 mcv0 的 IP 再查一次。
+    """
+    empty = {"ok": False, "count": 0, "items": [], "self": "", "product": "", "error": ""}
+
+    data = None
+    try:
+        data = parse_portal(http_portal())
+    except Exception:  # noqa: BLE001
+        data = None
+
+    if not data or str(data.get("error") or "") != "ok":
+        alt = ""
+        m = re.search(r"inet ([0-9.]+)/", sh("ip -4 addr show dev mcv0"))
+        if m:
+            alt = m.group(1)
+        if alt:
+            try:
+                data2 = parse_portal(http_portal(alt))
+                if data2 and str(data2.get("error") or "") == "ok":
+                    data = data2
+            except Exception:  # noqa: BLE001
+                pass
+
+    if not data:
+        empty["error"] = "no_response"
+        return empty
+    err = str(data.get("error") or "")
+    if err != "ok":
+        empty["error"] = err
+        return empty
+
+    items = []
+    try:
+        detail = json.loads(data.get("online_device_detail") or "{}")
+    except Exception:  # noqa: BLE001
+        detail = {}
+    for rid, info in detail.items():
+        items.append({
+            "id": str(rid),
+            "ip": info.get("ip", ""),
+            "os": info.get("os_name") or info.get("class_name") or "",
+            "class": info.get("class_name", ""),
+        })
+    items.sort(key=lambda x: x.get("ip", ""))
+    me = wan_ip()
+    for it in items:
+        it["self"] = bool(me) and it.get("ip") == me
+    return {"ok": data.get("error") == "ok",
+            "count": int(data.get("online_device_total") or len(items)),
+            "self": me,
+            "product": data.get("products_name") or data.get("billing_name") or "",
+            "items": items}
+
+
+def main():
+    pretty = "--pretty" in sys.argv
+    now = int(time.time())
+    leases = read_leases()
+    fdb = read_fdb()
+    neigh = read_neigh()
+
+    rows = []
+    seen = set()
+    for L in leases:
+        mac = L["mac"]
+        seen.add(mac)
+        dev = fdb.get(mac, "")
+        state = (neigh.get(mac) or {}).get("state", "")
+        online = bool(dev) or state in ("REACHABLE", "DELAY", "PROBE")
+        rows.append({
+            "ip": L["ip"],
+            "mac": mac,
+            "host": L["host"] or mac.replace(":", "")[-6:].upper(),
+            "iface": dev,
+            "type": IFACE_LABEL.get(dev, dev or "未知"),
+            "online": online,
+            "lease": human_lease(L["expire"], now),
+            "state": state or "-",
+        })
+
+    # 有邻居但没租约的设备（静态 IP / 自己配的地址）也补进来
+    for mac, info in neigh.items():
+        if mac in seen:
+            continue
+        state = info.get("state", "")
+        ip = info.get("ip", "")
+        if not ip:
+            continue
+        dev = fdb.get(mac, "")
+        rows.append({
+            "ip": ip, "mac": mac,
+            "host": mac.replace(":", "")[-6:].upper(),
+            "iface": dev, "type": IFACE_LABEL.get(dev, dev or "未知"),
+            "online": state in ("REACHABLE", "DELAY", "PROBE"),
+            "lease": "-", "state": state,
+        })
+
+    def ip_key(r):
+        try:
+            return tuple(int(x) for x in r["ip"].split(".")[:4])
+        except Exception:  # noqa: BLE001
+            return (999, 999, 999, 999)
+
+    rows.sort(key=lambda r: (not r["online"], ip_key(r)))
+
+    result = {
+        "ok": True,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total": len(rows),
+        "online": sum(1 for r in rows if r["online"]),
+        "devices": rows,
+        "portal": fetch_portal(),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2 if pretty else None))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

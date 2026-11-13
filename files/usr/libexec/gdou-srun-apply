@@ -1,0 +1,38 @@
+#!/bin/sh
+# 按当前配置重建全部连接：
+#   1) 拆除所有虚拟链路（每条会先登出自己的会话）
+#   2) 登出主链路
+#   3) 按新配置登录主链路
+#   4) 按新配置重建多链路
+#
+# 两种触发方式：
+#   · 基础设置里勾选了「保存后自动重建连接」-> 守护进程检测到配置变更后调用
+#   · 手动点「立即重连」按钮 -> 页面直接执行本脚本
+
+DUAL=/usr/libexec/gdou-srun-dual
+AUTH=/usr/libexec/gdou-srun
+
+echo "== 拆除虚拟链路 =="
+$DUAL down
+
+sleep 2
+
+echo "== 登出主链路 =="
+$AUTH logout || { sleep 3; $AUTH logout; }
+
+sleep 3
+
+echo "== 按配置登录 =="
+i=0
+while [ $i -lt 3 ]; do
+	if $AUTH login; then
+		break
+	fi
+	i=$((i + 1))
+	sleep 3
+done
+
+sleep 1
+
+echo "== 对齐多链路 =="
+$DUAL sync

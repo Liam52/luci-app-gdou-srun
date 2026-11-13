@@ -1,0 +1,252 @@
+#!/bin/sh
+# WAN 口 MAC 地址工具
+#   gdou-srun-mac show              查看当前 MAC、原始 MAC、MAC 池
+#   gdou-srun-mac refresh [模式]    刷新 MAC 并重新获取 DHCP
+#                                   模式：oui | random | pool | poolrandom
+#   gdou-srun-mac restore           恢复原始 MAC 并重新获取 DHCP
+#   gdou-srun-mac pool              打印 MAC 池
+#   gdou-srun-mac pool-reset [模式] 重建 MAC 池（5 个）
+
+KEY=gdou-srun.gdou_srun
+POOL_SIZE=5
+
+wan_dev() {
+	dev=$(uci -q get network.wan.device)
+	[ -z "$dev" ] && dev=eth0
+	echo "$dev"
+}
+
+cur_mac() {
+	cat "/sys/class/net/$(wan_dev)/address" 2>/dev/null
+}
+
+rnd_octet() {
+	printf '%02x' $((RANDOM % 256))
+}
+
+# 生成一个 MAC；keep_prefix=1 时保留原厂商前缀
+gen_one() {
+	keep=$1
+	orig=$(uci -q get "$KEY.mac_origin")
+	[ -z "$orig" ] && orig=$(cur_mac)
+	[ -z "$orig" ] && orig="02:00:00:00:00:01"
+
+	if [ "$keep" = "1" ]; then
+		p1=${orig%%:*}
+		rest=${orig#*:}
+		p2=${rest%%:*}
+		rest=${rest#*:}
+		p3=${rest%%:*}
+		echo "$p1:$p2:$p3:$(rnd_octet):$(rnd_octet):$(rnd_octet)"
+	else
+		# 完全随机：置本地管理位，清除多播位
+		o1=$(printf '%02x' $(( (RANDOM % 256) & 0xFE | 0x02 )))
+		echo "$o1:$(rnd_octet):$(rnd_octet):$(rnd_octet):$(rnd_octet):$(rnd_octet)"
+	fi
+}
+
+# 生成 5 个互不相同的 MAC 写入 mac_pool
+pool_build() {
+	mode=$1
+	case "$mode" in
+		poolrandom) keep=0 ;;
+		*)          keep=1 ;;
+	esac
+
+	list=""
+	i=0
+	guard=0
+	while [ "$i" -lt "$POOL_SIZE" ] && [ "$guard" -lt 60 ]; do
+		guard=$((guard + 1))
+		m=$(gen_one "$keep")
+		case " $list " in
+			*" $m "*) continue ;;
+		esac
+		list="$list $m"
+		i=$((i + 1))
+	done
+	list=$(echo "$list" | sed 's/^ *//')
+
+	[ -z "$(uci -q get "$KEY.mac_origin")" ] && uci set "$KEY.mac_origin=$(cur_mac)"
+	uci set "$KEY.mac_pool=$list"
+	uci commit gdou-srun
+	echo "$list"
+}
+
+# 确保池存在且够 5 个
+pool_ensure() {
+	mode=$1
+	pool=$(uci -q get "$KEY.mac_pool")
+	count=$(echo "$pool" | wc -w)
+	if [ "$count" -lt "$POOL_SIZE" ]; then
+		pool=$(pool_build "$mode")
+	fi
+	echo "$pool"
+}
+
+# 从池里随机挑一个与当前不同的
+pool_pick() {
+	pool=$1
+	cur=$(cur_mac)
+
+	list=""
+	for m in $pool; do
+		[ "$m" = "$cur" ] && continue
+		list="$list $m"
+	done
+	list=$(echo "$list" | sed 's/^ *//')
+	# 全都等于当前（理论上不会）则退回整个池
+	[ -z "$list" ] && list=$pool
+
+	n=$(echo "$list" | wc -w)
+	[ "$n" -eq 0 ] && return
+	idx=$((RANDOM % n))
+
+	i=0
+	for m in $list; do
+		if [ "$i" -eq "$idx" ]; then
+			echo "$m"
+			return
+		fi
+		i=$((i + 1))
+	done
+}
+
+# 门户地址（从 server 配置里取主机名）
+portal_host() {
+	s=$(uci -q get "$KEY.server")
+	[ -z "$s" ] && s="http://10.129.1.1"
+	echo "$s" | sed 's|^[a-z]*://||; s|/.*||; s|:.*||'
+}
+
+# 门户 80 端口能不能连上。校园网在认证前也允许访问门户，
+# 所以这是判断「这条链路到底通不通」最可靠的信号。
+portal_ok() {
+	h=$(portal_host)
+	[ -z "$h" ] && return 0
+	python3 -c 'import socket,sys
+try:
+    socket.create_connection((sys.argv[1], 80), 3).close()
+except Exception:
+    sys.exit(1)' "$h" 2>/dev/null
+}
+
+# 改 MAC 并等 DHCP 拿到地址（不含任何判断，供 apply_mac 复用）
+set_mac_dhcp() {
+	newmac=$1
+	dev=$(wan_dev)
+
+	uci set "network.wan.macaddr=$newmac"
+	uci commit network
+
+	ifdown wan >/dev/null 2>&1
+	sleep 1
+	if [ -e "/sys/class/net/$dev" ]; then
+		ip link set dev "$dev" down 2>/dev/null
+		ip link set dev "$dev" address "$newmac" 2>/dev/null
+		ip link set dev "$dev" up 2>/dev/null
+	fi
+	ifup wan >/dev/null 2>&1
+
+	i=0
+	while [ "$i" -lt 25 ]; do
+		if ip -4 addr show dev "$dev" 2>/dev/null | grep -q "inet "; then
+			break
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+}
+
+# 应用 MAC，并做端口安全保护。
+#
+# 背景：不少学校（含广东海洋大学）的接入交换机按 MAC 做端口绑定。
+# 换了 MAC 之后端口会被静默封禁——carrier 正常、能发不能收、一个包都回不来，
+# 而插件只会反复报 "Host is unreachable"，看起来像"认证不上"，很难排查。
+# 这里在换完 MAC 后校验门户是否可达，不可达就自动退回原始 MAC。
+apply_mac() {
+	newmac=$1
+	dev=$(wan_dev)
+	orig=$(uci -q get "$KEY.mac_origin")
+
+	[ -z "$orig" ] && {
+		orig=$(cur_mac)
+		uci set "$KEY.mac_origin=$orig"
+		uci commit "$KEY"
+	}
+
+	set_mac_dhcp "$newmac"
+
+	# 换 MAC 后最多等 12 秒确认门户可达
+	j=0
+	while [ "$j" -lt 12 ]; do
+		portal_ok && break
+		sleep 1
+		j=$((j + 1))
+	done
+
+	if ! portal_ok; then
+		echo "换 MAC 后门户不可达，判断触发了端口安全（MAC 绑定），正在恢复原始 MAC $orig" >&2
+		set_mac_dhcp "$orig"
+		uci set "network.wan.macaddr=$orig" 2>/dev/null || true
+		uci commit network 2>/dev/null || true
+		now=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+		ipv4=$(ip -4 addr show dev "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+		echo "{\"ok\": false, \"reason\": \"port_security\", \"mac\": \"$now\", \"ip\": \"$ipv4\", \"restored_to\": \"$orig\", \"msg\": \"换 MAC 后门户不可达，已自动恢复原始 MAC\"}"
+		return 1
+	fi
+
+	now=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+	ipv4=$(ip -4 addr show dev "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+	echo "{\"ok\": $([ -n "$ipv4" ] && echo true || echo false), \"mac\": \"$now\", \"ip\": \"$ipv4\", \"waited\": $j}"
+}
+
+case "$1" in
+	show)
+		echo "设备: $(wan_dev)"
+		echo "当前 MAC: $(cur_mac)"
+		echo "原始 MAC: $(uci -q get "$KEY.mac_origin")"
+		echo "uci macaddr: $(uci -q get network.wan.macaddr)"
+		echo "模式: $(uci -q get "$KEY.mac_mode")"
+		echo "MAC 池: $(uci -q get "$KEY.mac_pool")"
+		;;
+	pool)
+		echo "$(uci -q get "$KEY.mac_pool")"
+		;;
+	pool-reset)
+		echo "{\"ok\": true, \"pool\": \"$(pool_build "${2:-pool}")\"}"
+		;;
+	refresh)
+		mode=${2:-oui}
+		case "$mode" in
+			pool|poolrandom)
+				p=$(pool_ensure "$mode")
+				target=$(pool_pick "$p")
+				;;
+			random)
+				target=$(gen_one 0)
+				;;
+			*)
+				target=$(gen_one 1)
+				;;
+		esac
+		apply_mac "$target"
+		;;
+	restore)
+		orig=$(uci -q get "$KEY.mac_origin")
+		if [ -z "$orig" ]; then
+			echo '{"ok": false, "msg": "没有保存过原始 MAC"}'
+			exit 1
+		fi
+		# restore 本身就是「恢复」，不再走端口安全检查，避免重复切换
+		set_mac_dhcp "$orig"
+		dev=$(wan_dev)
+		now=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+		ipv4=$(ip -4 addr show dev "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+		echo "{\"ok\": $([ -n "$ipv4" ] && echo true || echo false), \"mac\": \"$now\", \"ip\": \"$ipv4\", \"restored\": true}"
+		;;
+	*)
+		echo "用法: $0 {show|pool|pool-reset [pool|poolrandom]|refresh [oui|random|pool|poolrandom]|restore}"
+		exit 2
+		;;
+esac

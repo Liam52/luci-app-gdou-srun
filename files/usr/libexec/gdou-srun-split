@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""多链路分流：把流量按选定策略分配到主链路和多条虚拟链路（mcv0..mcvN）。
+
+三种模式（配置项 gdou-srun.gdou_srun.split_mode）：
+  backup 网络备份：平时只用主链路，主链路掉线时整段切到备份链路
+  conn   负载均衡：每条新连接轮流选一条链路（N 条链路轮流）
+  dev    链路聚合：局域网 IP 后半段整体走第一条虚拟链路
+
+多账号池化：从账号建出来的链路（mcv1..）和主账号的第二条（mcv0）都一样参与
+conn 模式的轮询，所以 N 条链路 = N 份额度（前提是学校按账号/设备限额）。
+
+安全设计：
+  · 绝不改主路由表：每条虚拟链路的路由放在独立表 100+i，用 ip rule 或 fwmark 导流
+  · 表里必须有局域网路由，否则被导流的设备连路由器都会走错
+  · 所有 mcv* 都加进 wan 防火墙 zone，由 fw4 负责 NAT 与转发
+  · off 会把链、规则、跳转全部清干净
+
+用法：
+  gdou-srun-split sync           按 uci 里的 split_mode 应用（守护进程调用）
+  gdou-srun-split on [conn|dev]  手动指定模式
+  gdou-srun-split off            关闭
+  gdou-srun-split backup on|off  备份模式切换
+  gdou-srun-split status         查看状态
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+BASE_TABLE = 100
+CHAIN = "GDSPLIT"
+MARK_MAIN = "0x200"
+RULE_PRIO = 2000
+LOG = "/tmp/gdou-split.log"
+
+
+def log(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        with open(LOG, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(line, file=sys.stderr)
+
+
+def sh(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return ((p.stdout or "") + (p.stderr or "")).strip()
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
+
+
+def uci(key, default=""):
+    try:
+        out = subprocess.run(["uci", "-q", "get", "gdou-srun.gdou_srun.%s" % key],
+                             capture_output=True, text=True, timeout=10).stdout
+        return (out or "").strip() or default
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def iface_ip(name):
+    m = re.search(r"inet ([0-9.]+)/", sh("ip -4 addr show dev %s" % name))
+    return m.group(1) if m else ""
+
+
+def lan_info():
+    """自动探测 LAN 侧地址与网段，不写死任何私有网段。"""
+    ip = uci("ipaddr") or ""
+    if not ip:
+        out = sh("uci -q get network.lan.ipaddr")
+        ip = out.strip() if out and "." in out else ""
+    if not ip:
+        # 退而求其次：从 br-lan 实际地址取
+        ip = iface_ip("br-lan")
+    parts = ip.split(".") if ip else []
+    if len(parts) == 4:
+        base = "%s.%s.%s" % (parts[0], parts[1], parts[2])
+        return ip, base + ".0/24", base + ".128/25"
+    # 最后兜底：常见 OpenWrt 默认网段
+    return ip or "192.168.1.1", "192.168.1.0/24", "192.168.1.128/25"
+
+
+def links():
+    """当前实际存在的链路列表。第 0 项永远是主链路。
+
+    每项: {"iface": 名称或 None, "ip": 地址, "table": 表号或 None, "mark": 标记}
+    """
+    out = [{"iface": None, "ip": "", "table": None, "mark": MARK_MAIN}]
+    idx = 0
+    while True:
+        name = "mcv%d" % idx
+        if not os.path.exists("/sys/class/net/" + name):
+            break
+        out.append({"iface": name, "ip": iface_ip(name),
+                    "table": str(BASE_TABLE + idx),
+                    "mark": "0x%x" % (0x100 + idx)})
+        idx += 1
+    return out
+
+
+def mcv_gw(name):
+    for line in sh("ip route show table %s" % (BASE_TABLE + int(name[3:]))).splitlines():
+        if line.startswith("default"):
+            f = line.split()
+            return f[2] if len(f) > 2 else ""
+    return ""
+
+
+def zone_devices():
+    return sh("uci -q get firewall.@zone[1].device").replace("'", "").split()
+
+
+def ensure_zone(names):
+    have = zone_devices()
+    added = [n for n in names if n and n not in have]
+    if not added:
+        return True
+    for n in added:
+        sh("uci add_list firewall.@zone[1].device='%s'" % n)
+    sh("uci commit firewall")
+    sh("/etc/init.d/firewall reload >/dev/null 2>&1", timeout=90)
+    time.sleep(2)
+    return True
+
+
+# ---------------- 清理 ----------------
+
+def drop_chain():
+    if "-j %s" % CHAIN in sh("iptables -t mangle -S PREROUTING"):
+        sh("iptables -t mangle -D PREROUTING -i br-lan -j %s" % CHAIN)
+    sh("iptables -t mangle -F %s 2>/dev/null" % CHAIN)
+    sh("iptables -t mangle -X %s 2>/dev/null" % CHAIN)
+
+
+def drop_rules():
+    rules = sh("ip rule show")
+    marks = [MARK_MAIN] + ["0x%x" % (0x100 + i) for i in range(16)]
+    for mk in marks:
+        for _ in range(8):
+            m = re.search(r"fwmark %s lookup (\S+)" % mk, sh("ip rule show"))
+            if not m:
+                break
+            sh("ip rule del fwmark %s lookup %s" % (mk, m.group(1)))
+    ip, cidr, half = lan_info()
+    for src in (cidr, half):
+        for _ in range(8):
+            if "from %s lookup" % src not in sh("ip rule show"):
+                break
+            sh("ip rule del from %s table %s 2>/dev/null" % (src, BASE_TABLE))
+    _ = rules
+
+
+def clear_all():
+    drop_chain()
+    drop_rules()
+
+
+# ---------------- 各模式 ----------------
+
+def conn_rules_ok(L):
+    """判断现有分流链是否已经符合当前链路集合。
+
+    守护进程每分钟调用一次 sync，如果每次都重建链，重建瞬间是空链，
+    这段时间建立的新连接会漏掉打标（永远走主链路）。所以这里做幂等判断。
+    """
+    out = sh("iptables -t mangle -S %s 2>/dev/null" % CHAIN)
+    if not out:
+        return False
+    if "-j %s" % CHAIN not in sh("iptables -t mangle -S PREROUTING"):
+        return False
+    n = len(L)
+    marks = re.findall(r"--ctstate NEW .*?-j CONNMARK --set-xmark (0x[0-9a-f]+)", out)
+    if len(marks) != n:
+        return False
+    if marks != [x["mark"] for x in L]:
+        return False
+    for k, x in enumerate(L):
+        target = "main" if x["table"] is None else x["table"]
+        if "fwmark %s lookup %s" % (x["mark"], target) not in sh("ip rule show"):
+            return False
+    return True
+
+
+def mode_conn():
+    """N 条链路轮流：每条新连接按顺序分到不同链路。"""
+    L = links()
+    n = len(L)
+    if n < 2:
+        return {"ok": False, "msg": "只有一条链路，无需分流"}
+    lan_ip, cidr, _half = lan_info()
+
+    ensure_zone([x["iface"] for x in L if x["iface"]])
+    for x in L[1:]:
+        sh("ip route replace %s dev br-lan src %s table %s" % (cidr, lan_ip, x["table"]))
+
+    sh("iptables -t mangle -N %s 2>/dev/null" % CHAIN)
+    sh("iptables -t mangle -F %s" % CHAIN)
+    sh("iptables -t mangle -A %s -d %s -j RETURN" % (CHAIN, cidr))
+    # 用「随机 + 兜底」而不是 statistic nth：
+    # nth 在多核高并发建连时会漏判，漏判的连接 mark 永远是 0，
+    # 从此只走主链路。兜底规则保证任何新连接都不会漏。
+    for k, x in enumerate(L[:-1]):
+        sh("iptables -t mangle -A %s -m conntrack --ctstate NEW "
+           "-m statistic --mode random --probability %.6f "
+           "-j CONNMARK --set-mark %s" % (CHAIN, 1.0 / (n - k), x["mark"]))
+    # 兜底：只处理「还没有任何标记」的新连接，否则会把随机规则打上的标记冲掉
+    sh("iptables -t mangle -A %s -m conntrack --ctstate NEW "
+       "-m connmark --mark 0x0 "
+       "-j CONNMARK --set-mark %s" % (CHAIN, L[-1]["mark"]))
+    sh("iptables -t mangle -A %s -j CONNMARK --restore-mark" % CHAIN)
+
+    if "-j %s" % CHAIN not in sh("iptables -t mangle -S PREROUTING"):
+        sh("iptables -t mangle -A PREROUTING -i br-lan -j %s" % CHAIN)
+
+    for k, x in enumerate(L):
+        target = "main" if x["table"] is None else x["table"]
+        if "fwmark %s lookup %s" % (x["mark"], target) not in sh("ip rule show"):
+            sh("ip rule add fwmark %s lookup %s priority %d"
+               % (x["mark"], target, RULE_PRIO + k))
+
+    return {"ok": True, "mode": "conn", "links": n,
+            "msg": "%d 条链路轮流分流已开启" % n,
+            "ifaces": [x["iface"] or "main" for x in L], "lan": cidr}
+
+
+def mode_dev():
+    """局域网 IP 后半段整体走第一条虚拟链路。"""
+    L = links()
+    if len(L) < 2:
+        return {"ok": False, "msg": "只有一条链路，无需分流"}
+    lan_ip, cidr, half = lan_info()
+    target = L[1]
+
+    ensure_zone([target["iface"]])
+    sh("ip route replace %s dev br-lan src %s table %s" % (cidr, lan_ip, target["table"]))
+    drop_chain()
+
+    if "from %s lookup %s" % (half, target["table"]) not in sh("ip rule show"):
+        sh("ip rule add from %s lookup %s priority %s"
+           % (half, target["table"], RULE_PRIO))
+
+    return {"ok": True, "mode": "dev", "via": target["iface"], "half": half,
+            "msg": "局域网 %s 走 %s" % (half, target["iface"]), "lan": cidr}
+
+
+def persist(mode):
+    """把模式写进 uci。否则手动切换会被守护进程下一轮 sync 用旧值覆盖回去。"""
+    try:
+        subprocess.run(["uci", "set", "gdou-srun.gdou_srun.split_mode=%s" % mode],
+                       capture_output=True, timeout=10)
+        subprocess.run(["uci", "commit", "gdou-srun"], capture_output=True, timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def cmd_on(mode):
+    L = links()
+    if len(L) < 2:
+        return {"ok": False, "msg": "没有可用的虚拟链路（先建链路）"}
+    alive = [x for x in L[1:] if x["ip"]]
+    if not alive:
+        return {"ok": False, "msg": "虚拟链路都没有 IP"}
+
+    log("应用分流模式: %s（%d 条链路）" % (mode, len(L)))
+    clear_all()
+    out = mode_dev() if mode == "dev" else mode_conn()
+    if out.get("ok") and not os.environ.get("GDOU_SYNC"):
+        persist(mode)
+    log(json.dumps(out, ensure_ascii=False))
+    return out
+
+
+def cmd_off():
+    clear_all()
+    if not os.environ.get("GDOU_SYNC"):
+        persist("off")
+    log("分流已关闭")
+    return {"ok": True, "mode": "off", "msg": "已关闭分流（链路本身保留）"}
+
+
+def cmd_backup(arg):
+    """网络备份：主链路掉线时把局域网整段切到第一条虚拟链路。"""
+    L = links()
+    if len(L) < 2:
+        return {"ok": False, "msg": "没有备份链路"}
+    target = L[1]
+    lan_ip, cidr, _half = lan_info()
+    rule = "from %s lookup %s" % (cidr, target["table"])
+
+    if arg == "on":
+        if not target["ip"]:
+            return {"ok": False, "msg": "%s 不在线" % target["iface"]}
+        ensure_zone([target["iface"]])
+        sh("ip route replace %s dev br-lan src %s table %s" % (cidr, lan_ip, target["table"]))
+        if rule not in sh("ip rule show"):
+            sh("ip rule add from %s lookup %s priority 900" % (cidr, target["table"]))
+        log("网络备份: 已切到 %s（%s）" % (target["iface"], target["ip"]))
+        return {"ok": True, "mode": "backup", "state": "on",
+                "via": target["iface"], "ip": target["ip"]}
+
+    for _ in range(8):
+        if rule not in sh("ip rule show"):
+            break
+        sh("ip rule del from %s table %s" % (cidr, target["table"]))
+    log("网络备份: 已切回主链路")
+    return {"ok": True, "mode": "backup", "state": "off"}
+
+
+def cmd_sync():
+    os.environ["GDOU_SYNC"] = "1"
+    mode = uci("split_mode", "backup")
+    L = links()
+    if mode in ("off", "backup") or len(L) < 2:
+        clear_all()
+        return {"ok": True, "mode": mode, "links": len(L),
+                "msg": "分流未启用" if mode != "backup" else "备份模式待命"}
+    if mode == "conn":
+        L = links()
+        if len(L) >= 2 and conn_rules_ok(L):
+            return {"ok": True, "mode": "conn", "links": len(L),
+                    "msg": "分流规则已是最新（未重建）"}
+    return cmd_on(mode)
+
+
+def cmd_status():
+    L = links()
+    lan_ip, cidr, half = lan_info()
+    chain = sh("iptables -t mangle -S %s 2>/dev/null" % CHAIN)
+    return {
+        "ok": True,
+        "mode": uci("split_mode", "backup"),
+        "links": [{"iface": x["iface"] or "main", "ip": x["ip"],
+                   "table": x["table"], "mark": x["mark"],
+                   "gw": mcv_gw(x["iface"]) if x["iface"] else ""} for x in L],
+        "lan": cidr, "dev_half": half,
+        "rules": [l for l in sh("ip rule show").splitlines()
+                  if "fwmark" in l or ("from" in l and "lookup 1" in l)],
+        "chain_rules": len([l for l in chain.splitlines() if l.startswith("-A")]),
+        "hooked": "-j %s" % CHAIN in sh("iptables -t mangle -S PREROUTING"),
+        "in_wan_zone": [x for x in zone_devices() if x.startswith("mcv")],
+    }
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "sync":
+        out = cmd_sync()
+    elif cmd == "off":
+        out = cmd_off()
+    elif cmd == "backup":
+        out = cmd_backup(sys.argv[2] if len(sys.argv) > 2 else "on")
+    elif cmd == "on":
+        out = cmd_on(sys.argv[2] if len(sys.argv) > 2 else uci("split_mode", "conn"))
+    else:
+        out = cmd_status()
+    print(json.dumps(out, ensure_ascii=False, indent=2 if cmd == "status" else None))
+    return 0 if out.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

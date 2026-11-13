@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""多链路（实验性）：按配置推导链路计划，逐条建 macvlan、独立认证、自检。
+
+配置来源（全部在高阶设置里，未勾选 advanced 时一律不生效）：
+  advanced=1            总开关
+  dual_same_account=1   主账号开双链路（占 2 个设备额度）
+  subN_enabled=1        第 N 个从账号启用
+  subN_username/password
+  subN_dual=1           该从账号也开双链路
+
+安全设计（针对把路由器搞挂的那次事故）：
+  1. 绝不动主路由表：每条虚拟链路的路由放进独立表（100+N），
+     再用 `ip rule from <该链路 IP>` 把该源地址的流量导过去。
+  2. 认证用「源 IP 绑定」（GDOU_SOURCE_IP），不依赖主表默认路由。
+  3. 清理按 pidfile 只杀自己拉起的 udhcpc，绝不 killall。
+  4. 任一链路失败只回滚它自己，不影响其它链路和主链路。
+
+用法：
+  gdou-srun-dual plan     打印链路计划（不执行）
+  gdou-srun-dual up       按计划建链、认证、自检
+  gdou-srun-dual down     拆除所有 mcv* 链路与相关规则/表
+  gdou-srun-dual sync     按计划对齐（守护进程每 60 秒调用）
+  gdou-srun-dual status   计划 + 现状
+"""
+import json
+import os
+import random
+import re
+import socket
+import subprocess
+import sys
+import time
+
+KEY = "gdou-srun.gdou_srun"
+MAX_SUB = 3          # 最多 3 个从账号（本校实测：总链路 4 条以内最稳）
+MAX_LINKS = 4        # 含主链路的总链路数上限，超过容易触发门户检测
+MAX_EXTRA = MAX_LINKS - 1
+BASE_TABLE = 100
+LOG = "/tmp/gdou-dual.log"
+PORTAL = ("10.129.1.1", 80)
+STATE = "/tmp/gdou-dual.links.json"
+
+
+def log(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        with open(LOG, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(line, file=sys.stderr)
+
+
+def sh(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return ((p.stdout or "") + (p.stderr or "")).strip()
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
+
+
+def uci(key, default=""):
+    try:
+        out = subprocess.run(["uci", "-q", "get", "%s.%s" % (KEY, key)],
+                             capture_output=True, text=True, timeout=10).stdout
+        return (out or "").strip() or default
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def wan_dev():
+    return sh("uci -q get network.wan.device") or "eth0"
+
+
+def iface_ip(name):
+    m = re.search(r"inet ([0-9.]+)/", sh("ip -4 addr show dev %s" % name))
+    return m.group(1) if m else ""
+
+
+def build_plan():
+    """按配置推导链路列表。高级设置未开启时返回空列表（= 单链路）。"""
+    plan = []
+    if uci("advanced") != "1":
+        return plan
+
+    main_user, main_pwd = uci("username"), uci("password")
+    if (uci("dual_same_account") == "1" and main_user and main_pwd
+            and len(plan) < MAX_EXTRA):
+        plan.append({"slot": 0, "account": main_user, "password": main_pwd,
+                     "note": "主账号（同账号双链路）"})
+
+    n = len(plan)
+    for i in range(1, MAX_SUB + 1):
+        if len(plan) >= MAX_EXTRA:
+            break
+        if uci("sub%d_enabled" % i) != "1":
+            continue
+        user, pwd = uci("sub%d_username" % i), uci("sub%d_password" % i)
+        # 兼容旧字段：只有一个从账号时，空值回落到 sub_username
+        if i == 1 and not user:
+            user, pwd = uci("sub_username"), uci("sub_password")
+        if not user or not pwd:
+            continue
+        plan.append({"slot": n, "account": user, "password": pwd,
+                     "note": "从账号 %d" % i})
+        n += 1
+        if uci("sub%d_dual" % i) == "1" and len(plan) < MAX_EXTRA:
+            plan.append({"slot": n, "account": user, "password": pwd,
+                         "note": "从账号 %d（第二条）" % i})
+            n += 1
+
+    for item in plan:
+        item["iface"] = "mcv%d" % item["slot"]
+        item["table"] = str(BASE_TABLE + item["slot"])
+    return plan
+
+
+def temp_config(user, pwd, path):
+    if "'" in user or "'" in pwd:
+        raise ValueError("账号或密码含单引号，暂不支持")
+    with open("/etc/config/gdou-srun", "r", errors="replace") as fh:
+        text = fh.read()
+    text = re.sub(r"option\s+username\s+'[^']*'", "option username '%s'" % user, text)
+    text = re.sub(r"option\s+password\s+'[^']*'", "option password '%s'" % pwd, text)
+    with open(path, "w") as fh:
+        fh.write(text)
+    os.chmod(path, 0o600)
+
+
+def calc_mac(parent, seq):
+    """由父接口 MAC 推出稳定的第 seq 个 MAC（末字节 + seq）。"""
+    try:
+        mac = open("/sys/class/net/%s/address" % parent).read().strip()
+        head, last = mac.rsplit(":", 1)
+        return "%s:%02x" % (head, (int(last, 16) + seq) % 256)
+    except Exception:  # noqa: BLE001
+        return "02:00:00:00:00:%02x" % (seq % 256)
+
+
+def bind_probe(ip, timeout=6):
+    """从指定源 IP 发一个请求到门户。
+
+    返回 (通不通, 说明, 该 IP 是否已认证)。
+    "已认证" 判据：门户返回体里 online_ip 等于该 IP 且 error=ok。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        if ip:
+            s.bind((ip, 0))
+        s.connect(PORTAL)
+        s.sendall(b"GET /cgi-bin/rad_user_info?callback=sdu HTTP/1.0\r\n"
+                  b"Host: 10.129.1.1\r\nConnection: close\r\n\r\n")
+        raw = b""
+        while len(raw) < 2048:
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            raw += chunk
+        body = raw.decode("utf-8", "replace")
+        norm = body.replace(" ", "")
+        ok_err = '"error":"ok"' in norm
+        # 门户对副链路返回的 online_ip 常是本账号的主 IP，不能只比它；
+        # 设备明细里出现本 IP 同样说明这条会话在线。
+        in_list = ('"ip":"%s"' % ip) in norm
+        authed = ok_err and (('"online_ip":"%s"' % ip) in norm or in_list)
+        return (True, body.split("\r\n")[0][:60], authed)
+    except Exception as exc:  # noqa: BLE001
+        return (False, "%s: %s" % (type(exc).__name__, exc), False)
+    finally:
+        s.close()
+
+
+def del_rule(ip, table):
+    if not ip:
+        return
+    for _ in range(6):
+        if "from %s lookup %s" % (ip, table) not in sh("ip rule show"):
+            break
+        sh("ip rule del from %s table %s 2>/dev/null" % (ip, table))
+
+
+OFF_DIR = "/tmp"
+
+
+def off_marker(iface):
+    return os.path.join(OFF_DIR, "gdou-off-%s" % iface)
+
+
+def is_offline(iface):
+    return os.path.exists(off_marker(iface))
+
+
+def set_offline(iface, flag):
+    try:
+        m = off_marker(iface)
+        if flag:
+            with open(m, "w") as fh:
+                fh.write(str(int(time.time())))
+        elif os.path.exists(m):
+            os.unlink(m)
+    except OSError:
+        pass
+
+
+def logout_source(ip, label):
+    """用指定源 IP 登出该链路的会话。"""
+    if not ip:
+        return
+    try:
+        env = dict(os.environ)
+        env["GDOU_SOURCE_IP"] = ip
+        subprocess.run(["/usr/libexec/gdou-srun", "logout"], env=env,
+                       capture_output=True, timeout=25)
+        log("[%s] 已下线（登出会话）" % label)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def teardown_one(name):
+    """拆掉一条虚拟链路及其规则/表，不碰主链路。
+
+    拆之前先用该链路的源 IP 登出，否则门户那侧的会话会一直挂到超时，
+    占着设备额度。
+    """
+    ip = iface_ip(name)
+    if ip:
+        try:
+            env = dict(os.environ)
+            env["GDOU_SOURCE_IP"] = ip
+            subprocess.run(["/usr/libexec/gdou-srun", "logout"], env=env,
+                           capture_output=True, timeout=25)
+            log("[%s] 已登出该链路会话" % name)
+        except Exception:  # noqa: BLE001
+            pass
+    pidfile = "/var/run/%s.pid" % name
+    if os.path.exists(pidfile):
+        sh("kill $(cat %s) 2>/dev/null" % pidfile)
+        try:
+            os.unlink(pidfile)
+        except OSError:
+            pass
+    for t in range(BASE_TABLE, BASE_TABLE + 16):
+        del_rule(ip, str(t))
+        sh("ip route flush table %d 2>/dev/null" % t)
+    sh("ip link del %s 2>/dev/null" % name)
+    return name
+
+
+def teardown():
+    """拆掉所有 mcv* 链路及其规则/表（不碰主链路）。"""
+    removed = []
+    for name in sorted(os.listdir("/sys/class/net")):
+        if name.startswith("mcv"):
+            removed.append(teardown_one(name))
+    try:
+        os.unlink(STATE)
+    except OSError:
+        pass
+    for f in os.listdir("/tmp"):
+        if f.startswith("gdou-dual.") and f.endswith(".conf"):
+            try:
+                os.unlink(os.path.join("/tmp", f))
+            except OSError:
+                pass
+
+    # 一条虚拟链路都不剩时，把 wan zone 里残留的 mcv* 条目也清掉，
+    # 否则 fw4 每次重载都会警告设备不存在。
+    left = [n for n in os.listdir("/sys/class/net") if n.startswith("mcv")]
+    if not left:
+        devs = sh("uci -q get firewall.@zone[1].device").replace("'", "").split()
+        stale = [d for d in devs if d.startswith("mcv")]
+        if stale:
+            for d in stale:
+                sh("uci -q del_list firewall.@zone[1].device='%s'" % d)
+            sh("uci commit firewall")
+            sh("/etc/init.d/firewall reload >/dev/null 2>&1", timeout=90)
+            log("已清理 wan zone 中残留的虚拟链路条目: %s" % ",".join(stale))
+    return removed
+
+
+def rand_mac(parent):
+    """给「刷新 MAC/IP」用：从父接口 MAC 派生一个随机的末字节。"""
+    try:
+        mac = open("/sys/class/net/%s/address" % parent).read().strip()
+        head = mac.rsplit(":", 1)[0]
+        return "%s:%02x" % (head, random.randint(1, 250))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def setup_one(item, seq, parent, mac_override=""):
+    """建一条链路并认证。返回结果字典，失败时自己回滚这一条。"""
+    name = item["iface"]
+    result = {"iface": name, "note": item["note"], "account": item["account"],
+              "ok": False, "table": item["table"]}
+
+    err = sh("ip link add link %s name %s type macvlan mode bridge" % (parent, name))
+    if err and "File exists" not in err:
+        result["msg"] = "创建失败: " + err.splitlines()[0]
+        return result
+
+    mac = mac_override or calc_mac(parent, seq + 1)
+    sh("ip link set %s address %s" % (name, mac))
+    sh("ip link set %s up" % name)
+    result["mac"] = mac
+
+    pidfile = "/var/run/%s.pid" % name
+    sh("udhcpc -i %s -n -q -t 3 -T 3 -p %s" % (name, pidfile), timeout=45)
+    ip = iface_ip(name)
+    if not ip:
+        sh("ip link del %s 2>/dev/null" % name)
+        result["msg"] = "未拿到 IP"
+        return result
+    result["ip"] = ip
+
+    gw = ""
+    for line in sh("ip route show dev %s" % name).splitlines():
+        if line.startswith("default"):
+            gw = line.split()[2]
+            break
+    sh("ip route del default dev %s 2>/dev/null" % name)
+    if gw:
+        sh("ip route add default via %s dev %s table %s" % (gw, name, item["table"]))
+        sh("ip rule add from %s table %s" % (ip, item["table"]))
+        result["gw"] = gw
+    else:
+        result["msg"] = "未拿到网关"
+
+    conf = "/tmp/gdou-dual.%s.conf" % name
+    try:
+        temp_config(item["account"], item["password"], conf)
+    except ValueError as exc:
+        result["msg"] = str(exc)
+        return result
+
+    env = dict(os.environ)
+    env.update({"GDOU_SOURCE_IP": ip, "GDOU_CONFIG": conf,
+                "GDOU_STATE": "/tmp/gdou-dual.%s.state" % name})
+    try:
+        res = subprocess.run(["/usr/libexec/gdou-srun", "login"], env=env,
+                             capture_output=True, text=True, timeout=120)
+        out = (res.stdout or "").strip() or (res.stderr or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        out = "执行异常: %s" % exc
+    log("[%s] 认证: %s" % (name, out[:240]))
+    try:
+        os.unlink(conf)
+    except OSError:
+        pass
+
+    try:
+        result["auth_ok"] = json.loads(out).get("ok", False)
+    except Exception:  # noqa: BLE001
+        result["auth_ok"] = False
+
+    data_ok, probe, authed = bind_probe(ip)
+    result["data_ok"] = data_ok
+    result["probe"] = probe
+    result["ok"] = bool(result["auth_ok"] and data_ok)
+    if not result["auth_ok"]:
+        result["msg"] = "认证失败"
+    elif not data_ok:
+        result["msg"] = "认证成功但数据不通（检查 HNAT 是否支持 macvlan）"
+    else:
+        result["msg"] = "就绪"
+    return result
+
+
+def public_plan(plan):
+    """对外输出时去掉密码，避免在页面上泄露。"""
+    return [{k: v for k, v in it.items() if k != "password"} for it in plan]
+
+
+def cmd_plan():
+    plan = build_plan()
+    return {"ok": True, "advanced": uci("advanced") == "1",
+            "count": len(plan), "links": public_plan(plan)}
+
+
+def cmd_sync():
+    """让实际链路与配置计划保持一致：缺的建、多的拆、掉线的重建。
+
+    守护进程每 60 秒调用一次，所以勾选开关后无需手动 up。
+    """
+    plan = build_plan()
+    desired = {it["iface"]: it for it in plan}
+    removed = []
+
+    for name in sorted(os.listdir("/sys/class/net")):
+        if name.startswith("mcv") and name not in desired:
+            removed.append(teardown_one(name))
+            log("[sync] 拆除计划外的 %s" % name)
+
+    results = []
+    for seq, item in enumerate(plan):
+        name = item["iface"]
+        if is_offline(name):
+            ip = iface_ip(name)
+            results.append({"iface": name, "ok": True, "ip": ip,
+                            "action": "offline", "note": item["note"],
+                            "authed": False})
+            continue
+        if not os.path.exists("/sys/class/net/%s" % name):
+            r = setup_one(item, seq, wan_dev())
+            r["action"] = "created"
+            results.append(r)
+            continue
+        ip = iface_ip(name)
+        data_ok, probe, authed = bind_probe(ip) if ip else (False, "无 IP", False)
+        if data_ok:
+            # 数据通路通就算健康。门户的认证判定对副链路不可靠，
+            # 过去按它重建会导致每分钟重新认证一次，反而触发门户限流。
+            if not authed:
+                log("[sync] %s 数据通但门户未确认（%s），保留不重建" % (name, probe))
+            results.append({"iface": name, "ok": True, "ip": ip,
+                            "authed": authed, "action": "already-up",
+                            "note": item["note"]})
+        else:
+            log("[sync] %s 数据不通（%s），重建" % (name, probe))
+            teardown_one(name)
+            r = setup_one(item, seq, wan_dev())
+            r["action"] = "rebuilt"
+            results.append(r)
+
+    # 链路对齐后，按配置应用聚合模式（conn / dev / off）
+    try:
+        subprocess.run(["/usr/libexec/gdou-srun-split", "sync"],
+                       capture_output=True, timeout=150)
+    except Exception:  # noqa: BLE001
+        pass
+
+    ready = sum(1 for r in results if r.get("ok"))
+    out = {"ok": (len(plan) == 0) or (ready == len(plan)),
+           "planned": len(plan), "ready": ready,
+           "removed": removed, "links": results}
+    if plan or removed:
+        log("[sync] " + json.dumps({"planned": len(plan), "ready": ready,
+                                    "removed": removed}, ensure_ascii=False))
+    return out
+
+
+def cmd_up():
+    plan = build_plan()
+    if not plan:
+        return {"ok": False, "msg": "没有要建的链路（高阶设置未开、或没有可用的从账号）"}
+    parent = wan_dev()
+    teardown()
+    log("开始建 %d 条链路（父接口 %s）" % (len(plan), parent))
+
+    results = []
+    for seq, item in enumerate(plan):
+        log("--- %s / %s ---" % (item["iface"], item["note"]))
+        results.append(setup_one(item, seq, parent))
+
+    ok = sum(1 for r in results if r["ok"])
+    try:
+        with open(STATE, "w") as fh:
+            json.dump(results, fh, ensure_ascii=False)
+    except OSError:
+        pass
+    out = {"ok": ok == len(results) and ok > 0, "total": len(results),
+           "ready": ok, "links": results,
+           "msg": "%d/%d 条链路就绪" % (ok, len(results))}
+    log(json.dumps(out, ensure_ascii=False)[:800])
+    return out
+
+
+def cmd_reauth():
+    """拆掉全部虚拟链路，再按配置重新建立并认证。"""
+    log("重新认证链路：先拆除，再按配置重建")
+    removed = teardown()
+    time.sleep(2)
+    out = cmd_sync()
+    out["removed"] = removed
+    out["reauth"] = True
+    return out
+
+
+def cmd_offline(iface):
+    """下线某条链路：登出它的会话，并在标记文件里记住，sync 不会自动重登。"""
+    label = "主链路" if iface in ("", "main", "eth0", "wan") else iface
+    if label == "主链路":
+        try:
+            subprocess.run(["/usr/libexec/gdou-srun", "logout"],
+                           capture_output=True, timeout=30)
+        except Exception:  # noqa: BLE001
+            pass
+        # 让守护进程也暂停自动重登
+        try:
+            with open("/tmp/gdou-srun.pause", "w") as fh:
+                fh.write(str(int(time.time())))
+        except OSError:
+            pass
+        set_offline("main", True)
+        log("主链路已下线（守护进程暂停自动重登）")
+        return {"ok": True, "iface": "main", "op": "offline",
+                "msg": "主链路已下线；点「重连」可恢复"}
+
+    if not os.path.exists("/sys/class/net/%s" % iface):
+        return {"ok": False, "iface": iface, "op": "offline", "msg": "该链路不存在"}
+    ip = iface_ip(iface)
+    logout_source(ip, iface)
+    set_offline(iface, True)
+    return {"ok": True, "iface": iface, "op": "offline", "ip": ip,
+            "msg": "%s 已下线（链路保留，不再自动重登）" % iface}
+
+
+def cmd_online(iface):
+    """取消下线标记（不立即重连，交给 sync / reauth）。"""
+    set_offline(iface, False)
+    if iface in ("", "main", "eth0", "wan"):
+        set_offline("main", False)
+        try:
+            if os.path.exists("/tmp/gdou-srun.pause"):
+                os.unlink("/tmp/gdou-srun.pause")
+        except OSError:
+            pass
+    return {"ok": True, "iface": iface, "op": "online", "msg": "已恢复自动重登"}
+
+
+def cmd_link(op, iface):
+    """单条链路操作。op=reauth 重新认证；op=refresh 换 MAC+IP 后重登。"""
+    if iface in ("", "main", "eth0", "wan"):
+        if op == "reauth":
+            sh("/usr/libexec/gdou-srun logout", timeout=45)
+            time.sleep(2)
+            out = sh("/usr/libexec/gdou-srun login", timeout=150)
+            return {"ok": True, "iface": "main", "op": op, "msg": out[-240:]}
+        mac_out = sh("/usr/libexec/gdou-srun-mac refresh", timeout=150)
+        time.sleep(3)
+        lg = sh("/usr/libexec/gdou-srun login", timeout=150)
+        return {"ok": True, "iface": "main", "op": op,
+                "msg": (mac_out.replace("\n", " ")[-160:] + " | " + lg[-160:])}
+
+    plan = build_plan()
+    target = None
+    seq = 0
+    for i, it in enumerate(plan):
+        if it["iface"] == iface:
+            target = it
+            seq = i
+            break
+    if target is None:
+        return {"ok": False, "iface": iface, "op": op,
+                "msg": "该链路不在当前计划里（可能没启用、或账号密码没填）"}
+
+    set_offline(iface, False)
+    if os.path.exists("/tmp/gdou-srun.pause"):
+        try:
+            os.unlink("/tmp/gdou-srun.pause")
+        except OSError:
+            pass
+    parent = wan_dev()
+    old = teardown_one(iface)
+    time.sleep(2)
+    mac = rand_mac(parent) if op == "refresh" else ""
+    res = setup_one(target, seq, parent, mac)
+    res["op"] = op
+    res["old"] = old
+    if not res.get("msg"):
+        res["msg"] = "就绪" if res.get("ok") else "未就绪"
+    return res
+
+
+def cmd_down():
+    removed = teardown()
+    log("已拆除: %s" % (", ".join(removed) if removed else "无"))
+    return {"ok": True, "removed": removed, "msg": "已拆除虚拟链路与相关规则"}
+
+
+def cmd_status():
+    plan = build_plan()
+    by_iface = {it["iface"]: it for it in plan}
+    existing = []
+    for name in sorted(os.listdir("/sys/class/net")):
+        if not name.startswith("mcv"):
+            continue
+        ip = iface_ip(name)
+        if ip:
+            data_ok, probe, authed = bind_probe(ip)
+        else:
+            data_ok, authed, probe = False, False, "无 IP"
+        item = {"iface": name, "ip": ip, "offline": is_offline(name),
+                "authed": (authed or data_ok),
+                "portal_authed": authed, "data_ok": data_ok, "probe": probe}
+        if name in by_iface:
+            item["account"] = by_iface[name].get("account", "")
+            item["note"] = by_iface[name].get("note", "")
+        existing.append(item)
+
+    # 被手动下线、但已不在接口列表里的链路，归到「已下线」而不是「未建立」
+    for it in plan:
+        name = it["iface"]
+        if is_offline(name) and name not in {e["iface"] for e in existing}:
+            existing.append({"iface": name, "ip": "", "offline": True,
+                             "authed": False, "portal_authed": False,
+                             "data_ok": False, "probe": "已手动下线",
+                             "account": it.get("account", ""),
+                             "note": it.get("note", "")})
+
+    have = {e["iface"] for e in existing}
+    missing = [it for it in plan if it["iface"] not in have]
+    return {"ok": True, "advanced": uci("advanced") == "1",
+            "dual_same_account": uci("dual_same_account"),
+            "main_offline": is_offline("main"),
+            "planned": len(plan), "ready": sum(1 for e in existing if e["authed"]),
+            "links": public_plan(plan), "existing": existing,
+            "missing": public_plan(missing),
+            "rules": [l for l in sh("ip rule show").splitlines() if "lookup 1" in l]}
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    arg = sys.argv[2] if len(sys.argv) > 2 else ""
+    if cmd == "offline":
+        out = cmd_offline(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif cmd == "online":
+        out = cmd_online(sys.argv[2] if len(sys.argv) > 2 else "")
+    elif cmd in ("reauth", "refresh") and arg:
+        out = cmd_link(cmd, arg)
+    else:
+        fn = {"plan": cmd_plan, "up": cmd_up, "down": cmd_down,
+              "sync": cmd_sync, "reauth": cmd_reauth}.get(cmd, cmd_status)
+        out = fn()
+    print(json.dumps(out, ensure_ascii=False))
+    return 0 if out.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

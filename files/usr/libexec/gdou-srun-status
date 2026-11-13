@@ -1,0 +1,59 @@
+#!/bin/sh
+# 输出当前联网状态 + 关键配置（单行 JSON），供 LuCI 首页使用。
+# 注意：绝不输出密码。
+
+K=gdou-srun.gdou_srun
+
+dev=$(uci -q get network.wan.device)
+[ -z "$dev" ] && dev=eth0
+
+mac=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+ip=$(ip -4 addr show dev "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+[ -z "$ip" ] && ip=$(ip -4 addr show dev "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\) .*/\1/p' | head -1)
+
+if /usr/libexec/gdou-srun check >/dev/null 2>&1; then
+	online=true
+else
+	online=false
+fi
+
+enabled=$(uci -q get $K.enabled)
+[ -z "$enabled" ] && enabled=1
+
+# ---- 配置摘要 ----
+user=$(uci -q get $K.username)
+server=$(uci -q get $K.server)
+[ -z "$server" ] && server="http://10.129.1.1"
+acid=$(uci -q get $K.acid)
+[ -z "$acid" ] && acid=25
+renew_on=$(uci -q get $K.renew_enable)
+renew_times=$(uci -q get $K.renew_times)
+pos=$(uci -q get $K.portal_os)
+[ -z "$pos" ] && pos="HarmonyOS"
+pname=$(uci -q get $K.portal_name)
+[ -z "$pname" ] && pname="Huawei"
+adv=$(uci -q get $K.advanced)
+dual=$(uci -q get $K.dual_same_account)
+macref=$(uci -q get $K.mac_refresh)
+interval=$(uci -q get $K.interval)
+[ -z "$interval" ] && interval=1
+test_host=$(uci -q get $K.test_host)
+
+esc() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+printf '{"online":%s,"enabled":%s,"mac":"%s","ip":"%s","dev":"%s",' \
+	"$online" \
+	"$([ "$enabled" = "1" ] && echo true || echo false)" \
+	"$(esc "$mac")" "$(esc "$ip")" "$(esc "$dev")"
+
+printf '"user":"%s","server":"%s","acid":"%s","renew_enable":"%s","renew_times":"%s",' \
+	"$(esc "$user")" "$(esc "$server")" "$(esc "$acid")" \
+	"$(esc "$renew_on")" "$(esc "$renew_times")"
+
+printf '"portal_os":"%s","portal_name":"%s","advanced":"%s","dual":"%s",' \
+	"$(esc "$pos")" "$(esc "$pname")" "$(esc "$adv")" "$(esc "$dual")"
+
+printf '"mac_refresh":"%s","interval":"%s","test_host":"%s"}\n' \
+	"$(esc "$macref")" "$(esc "$interval")" "$(esc "$test_host")"

@@ -1,0 +1,292 @@
+#!/bin/sh
+# 后台循环：1 秒检测联网状态，认证尝试有独立冷却；
+# 到设定时刻主动下线，等待若干秒后自动重新登录（刷新会话）。
+
+LOG=/tmp/gdou-srun.log
+MARK=/tmp/gdou-srun.renew
+
+log() {
+	logger -t gdou-srun "$*"
+	echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG" 2>/dev/null
+	[ -f "$LOG" ] && tail -n 200 "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
+}
+
+# 取 JSON 里某个键的字符串值（不依赖 jq）
+json_field() {
+	printf '%s' "$1" | sed -n 's/.*"'"$2"'": *"\([^"]*\)".*/\1/p'
+}
+
+uci_int() {
+	v=$(uci -q get "$1")
+	case "$v" in
+		''|*[!0-9]*) echo "$2" ;;
+		*) echo "$v" ;;
+	esac
+}
+
+# 归一配电 4 位时刻，非法则丢弃
+norm_hhmm() {
+	case "$1" in
+		[0-9][0-9][0-9][0-9]) echo "$1" ;;
+		*) echo "" ;;
+	esac
+}
+
+# 当前 HHMM 是否在时刻表里
+match_time() {
+	for t in $1; do
+		[ "$t" = "$2" ] && return 0
+	done
+	return 1
+}
+
+# 等网络起来
+sleep 8
+
+PAUSE_UNTIL=0
+LAST_LOGIN=0
+MAC_STAMP=/tmp/gdou-srun.mac
+LAST_MAC=0
+LAST_DUAL=0
+LAST_CFG=0
+LAST_CHECK=0
+LAST_ONLINE=1
+CFG_SIG=""
+[ -f "$MAC_STAMP" ] && LAST_MAC=$(cat "$MAC_STAMP" 2>/dev/null)
+[ -z "$LAST_MAC" ] && LAST_MAC=0
+
+while :; do
+	now=$(date +%s)
+	TODAY=$(date +%Y%m%d)
+
+	enabled=$(uci -q get gdou-srun.gdou_srun.enabled)
+	if [ "$enabled" = "0" ]; then
+		sleep 5
+		continue
+	fi
+
+	DETECT=$(uci_int gdou-srun.gdou_srun.interval 1)
+	[ "$DETECT" -lt 1 ] && DETECT=1
+	[ "$DETECT" -gt 3600 ] && DETECT=3600
+
+	LOGIN_GAP=$(uci_int gdou-srun.gdou_srun.login_cooldown 10)
+	[ "$LOGIN_GAP" -lt 5 ] && LOGIN_GAP=5
+
+	# ---- 配置变更侦测：改了主/从账号或多链路设置 -> 先下线所有连接，再按新配置重连 ----
+	# 指纹只取账号与多链路相关字段；last_good_acid 之类每次登录都会变的字段必须排除，
+	# 否则会自己触发自己，形成「登录 -> 指纹变 -> 重新登录」的死循环。
+	ACFG_NOW=$(date +%s)
+	if [ $((ACFG_NOW - LAST_CFG)) -ge 5 ]; then
+		LAST_CFG=$ACFG_NOW
+		ACFG_SIG=$(uci -q show gdou-srun 2>/dev/null \
+			| grep -E "\.(username|password|sub1|sub2|sub3|sub4|dual_same_account|advanced)" \
+			| sort | md5sum | cut -c1-12)
+
+		if [ -z "$CFG_SIG" ]; then
+			CFG_SIG="$ACFG_SIG"
+		elif [ "$ACFG_SIG" != "$CFG_SIG" ]; then
+			CFG_SIG="$ACFG_SIG"
+			# 默认不自动重建：只有勾了「保存后自动重建连接」才动手；
+			# 未勾选时只记一条日志，等用户手动点「立即重连」。
+			AUTO_APPLY=$(uci -q get gdou-srun.gdou_srun.auto_apply)
+			if [ "$AUTO_APPLY" != "1" ]; then
+				log "配置已变更（自动重建未开启，等待手动「立即重连」）"
+			else
+				ACFG_U=$(uci -q get gdou-srun.gdou_srun.username)
+				ACFG_P=$(uci -q get gdou-srun.gdou_srun.password)
+				# 凭据被清空时不动手，否则会把自己踢下线且再也登不回来
+				if [ -n "$ACFG_U" ] && [ -n "$ACFG_P" ]; then
+					log "配置已变更，按新配置重建连接：下线全部会话 -> 重新登录 -> 对齐多链路"
+					/usr/libexec/gdou-srun-apply >/tmp/gdou-apply.log 2>&1
+					PAUSE_UNTIL=0
+					LAST_LOGIN=$(date +%s)
+				else
+					log "配置已变更但账号或密码为空，暂不重建连接"
+				fi
+			fi
+		fi
+	fi
+
+	# ---- 多链路同步：开关打开或已有虚拟链路时，每 60 秒与配置对齐 ----
+	# 放在这里而不是循环末尾：在线/离线两条分支都会 continue，末尾会被跳过。
+	ADV=$(uci -q get gdou-srun.gdou_srun.advanced)
+	DUALC=$(uci -q get gdou-srun.gdou_srun.dual_same_account)
+	if [ "$ADV" = "1" ] || [ "$DUALC" = "1" ] || [ -e /sys/class/net/mcv0 ]; then
+		NCUR=$(date +%s)
+		if [ $((NCUR - LAST_DUAL)) -ge 60 ] && [ ! -f /tmp/gdou-dual.lock ]; then
+			LAST_DUAL=$NCUR
+			: > /tmp/gdou-dual.lock
+			( /usr/libexec/gdou-srun-dual sync >/tmp/gdou-dual.sync.out 2>&1
+			  rm -f /tmp/gdou-dual.lock ) &
+		fi
+	fi
+
+	# ---- 定时重连：到点主动下线，等 N 秒再登录 ----
+	RENEW_ON=$(uci -q get gdou-srun.gdou_srun.renew_enable)
+	if [ "$RENEW_ON" != "0" ]; then
+		RENEW_TIMES=$(uci -q get gdou-srun.gdou_srun.renew_times)
+		[ -z "$RENEW_TIMES" ] && RENEW_TIMES="0500 1300 2000"
+		# 逗号统一成空格
+		RENEW_TIMES=$(printf '%s' "$RENEW_TIMES" | tr ',' ' ')
+
+		CUR=$(date +%H%M)
+		if match_time "$RENEW_TIMES" "$CUR"; then
+			STAMP="$TODAY-$CUR"
+			LAST=""
+			[ -f "$MARK" ] && LAST=$(cat "$MARK" 2>/dev/null)
+			if [ "$LAST" != "$STAMP" ]; then
+				REPLY_GAP=$(uci_int gdou-srun.gdou_srun.renew_gap 5)
+				[ "$REPLY_GAP" -lt 1 ] && REPLY_GAP=1
+				[ "$REPLY_GAP" -gt 60 ] && REPLY_GAP=60
+
+				log "到点定时重连：下线，等待 ${REPLY_GAP} 秒后重新登录"
+				out=$(/usr/libexec/gdou-srun renew "$REPLY_GAP" 2>&1)
+				printf '%s' "$STAMP" > "$MARK"
+
+				kind=$(json_field "$out" kind)
+				case "$out" in
+					*'"ok": true'*)
+						log "定时重连完成：$out"
+						PAUSE_UNTIL=0
+						LAST_CHECK=0
+						;;
+					*)
+						log "定时重连未成功：$out"
+						# 登录若因密码错误失败，沿用退避
+						[ "$kind" = "password" ] && PAUSE_UNTIL=$((now + 1800))
+						;;
+				esac
+				LAST_LOGIN=$(date +%s)
+				sleep "$DETECT"
+				continue
+			fi
+		fi
+	fi
+
+	# 错误暂停期
+	if [ "$now" -lt "$PAUSE_UNTIL" ]; then
+		sleep "$DETECT"
+		continue
+	fi
+
+	# ---- 网络备份模式：主链路掉线就把局域网切到第二链路 ----
+	SMODE=$(uci -q get gdou-srun.gdou_srun.split_mode)
+	BK_MARK=/tmp/gdou-backup.on
+	# 节流：check 每次都起一个 Python 进程 + 打一次网络，1 秒一次太重。
+	# 每 CHECK_GAP 秒真正探测一次，其余轮次沿用上次结果。
+	CHECK_GAP=3
+	if [ $((now - LAST_CHECK)) -ge "$CHECK_GAP" ]; then
+		if /usr/libexec/gdou-srun check >/dev/null 2>&1; then
+			LAST_ONLINE=1
+		else
+			LAST_ONLINE=0
+		fi
+		LAST_CHECK=$now
+	fi
+	ONLINE=$LAST_ONLINE
+
+	if [ "$SMODE" = "backup" ] && [ -e /sys/class/net/mcv0 ]; then
+		if [ "$ONLINE" = "1" ]; then
+			if [ -f "$BK_MARK" ]; then
+				/usr/libexec/gdou-srun-split backup off >/dev/null 2>&1
+				rm -f "$BK_MARK"
+				log "主链路已恢复，切回主链路"
+			fi
+		else
+			if [ ! -f "$BK_MARK" ]; then
+				# 只有备份链路确实已认证才切过去，否则切了也是断网
+				if /usr/libexec/gdou-srun-dual status 2>/dev/null | grep -q '"authed": true'; then
+					out=$(/usr/libexec/gdou-srun-split backup on 2>&1)
+					case "$out" in
+						*'"ok": true'*)
+							printf '%s' "$now" > "$BK_MARK"
+							log "主链路掉线，已切换到第二链路备份：$out"
+							;;
+						*)
+							log "备份切换失败（不重试直到下一轮）：$out"
+							;;
+					esac
+				else
+					log "主链路掉线，但备份链路尚未认证，继续尝试认主链路"
+				fi
+			fi
+		fi
+	fi
+
+	# 已联网：只做检测
+	if [ "$ONLINE" = "1" ]; then
+		sleep "$DETECT"
+		continue
+	fi
+
+	# 主链路被手动下线时，暂停一切自动重登（点「重连」会清掉这个标记）
+	if [ -f /tmp/gdou-srun.pause ]; then
+		sleep "$DETECT"
+		continue
+	fi
+
+	# 离线：认证尝试受冷却限制；备份期间每 10 分钟才尝试恢复主链路一次
+	if [ -f "$BK_MARK" ]; then
+		if [ $((now - LAST_LOGIN)) -lt 600 ]; then
+			sleep "$DETECT"
+			continue
+		fi
+	else
+		if [ $((now - LAST_LOGIN)) -lt "$LOGIN_GAP" ]; then
+			sleep "$DETECT"
+			continue
+		fi
+	fi
+	LAST_LOGIN=$now
+
+	# ---- 认证前轮换 MAC（可选；用最小间隔防止每次重试都换）----
+	MAC_ON=$(uci -q get gdou-srun.gdou_srun.mac_refresh)
+	if [ "$MAC_ON" = "1" ]; then
+		MAC_GAP=$(uci_int gdou-srun.gdou_srun.mac_gap 300)
+		[ "$MAC_GAP" -lt 60 ] && MAC_GAP=60
+		if [ $((now - LAST_MAC)) -ge "$MAC_GAP" ]; then
+			LAST_MAC=$now
+			printf '%s' "$now" > "$MAC_STAMP"
+
+			MODE=$(uci -q get gdou-srun.gdou_srun.mac_mode)
+			[ -z "$MODE" ] && MODE=pool
+
+			macout=$(/usr/libexec/gdou-srun-mac refresh "$MODE" 2>&1)
+			log "认证前轮换 MAC（模式 $MODE）：$macout"
+
+			# 换完 MAC 已重新拿到 IP，本次直接尝试登录
+			LAST_LOGIN=$((now - LOGIN_GAP))
+		fi
+	fi
+
+	out=$(/usr/libexec/gdou-srun login 2>&1)
+	kind=$(json_field "$out" kind)
+
+	case "$kind" in
+		ok)
+			log "登录成功 $out"
+			LAST_CHECK=0
+			LAST_ONLINE=1
+			;;
+		password)
+			log "账号或密码错误，暂停 30 分钟：$out"
+			PAUSE_UNTIL=$((now + 1800))
+			;;
+		rate_limit)
+			log "认证被限流，暂停 3 分钟：$out"
+			PAUSE_UNTIL=$((now + 180))
+			;;
+		config)
+			log "配置不完整：$out"
+			PAUSE_UNTIL=$((now + 300))
+			;;
+		disabled)
+			sleep 5
+			;;
+		*)
+			log "登录失败：$out"
+			;;
+	esac
+
+	sleep "$DETECT"
+done
