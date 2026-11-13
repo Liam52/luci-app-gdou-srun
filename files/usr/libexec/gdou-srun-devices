@@ -32,6 +32,12 @@ IFACE_LABEL = {
 }
 
 
+def safe_dev(name, default=""):
+    """只允许合法的网络接口名，避免拼进 shell 时被注入。"""
+    name = (name or "").strip()
+    return name if re.match(r"^[A-Za-z0-9_.@-]{1,15}$", name) else default
+
+
 def sh(cmd, timeout=6):
     """跑一条命令，失败返回空串（设备列表不该因为某条命令失败而整体崩掉）。"""
     try:
@@ -128,7 +134,7 @@ def wan_ip():
     except OSError:
         dev = ""
     if not dev:
-        dev = (sh("uci -q get network.wan.device").strip() or "eth0")
+        dev = safe_dev(sh("uci -q get network.wan.device").strip(), "eth0")
     out = sh("ip -4 addr show dev %s" % dev)
     m = re.search(r"inet ([0-9.]+)/", out)
     return m.group(1) if m else ""

@@ -34,6 +34,8 @@ CFG_EVERY = 5            # 配置重读周期
 PROBE_ONLINE = 10        # 在线时的探测间隔
 PROBE_OFFLINE = 3        # 离线时的探测间隔
 BACKOFF = [5, 10, 20, 40, 60]
+# 门户 BAS 类错误（限流/设备忙）单独用更长的退避，短时间重试只会加重限流
+BACKOFF_AC = [30, 60, 120, 300]
 
 # ---------------------------------------------------------------- 日志
 
@@ -291,9 +293,13 @@ class Agent:
         if self.silent >= 3:
             return          # 链路都不通，别撞门户
 
-        # 备份模式：主链路掉线就把局域网切到虚拟链路
+        # 备份模式：主链路掉线就把局域网切到虚拟链路。
+        # 注意：这里不能每轮（3 秒）都起子进程查状态，否则断网时会变成
+        # 「每 3 秒 fork 一个 python」——正是重构前要消灭的开销。
+        now = time.time()
         if cfg.get("split_mode") == "backup" and os.path.exists("/sys/class/net/mcv0"):
-            if not os.path.exists(BK_MARK):
+            if not os.path.exists(BK_MARK) and now - self.last_bk_probe >= 30:
+                self.last_bk_probe = now
                 ok, out, _ = run("gdou-srun-dual", ["status"], timeout=40)
                 if '"authed": true' in out:
                     ok2, _, _ = run("gdou-srun-split", ["backup", "on"], timeout=60)
@@ -316,10 +322,17 @@ class Agent:
             self.next_login = 0
             self.set_state("online", "登录成功")
         else:
-            wait = BACKOFF[min(self.backoff_idx, len(BACKOFF) - 1)]
+            # 区分「网络不通」和「门户 BAS 限流」：后者要退得更久
+            ac_fail = '"kind": "ac"' in detail
+            table = BACKOFF_AC if ac_fail else BACKOFF
+            wait = table[min(self.backoff_idx, len(table) - 1)]
             self.backoff_idx += 1
             self.next_login = time.time() + wait
-            log("login_failed", detail=detail, retry_in=wait)
+            if ac_fail:
+                log("login_throttled", detail=detail[-160:], retry_in=wait,
+                    msg="门户 BAS 限流，延长退避")
+            else:
+                log("login_failed", detail=detail, retry_in=wait)
 
     # ---------- 周期同步 ----------
     def sync_all(self, cfg):
@@ -389,7 +402,7 @@ class Agent:
 
     # ---------- 启动 ----------
     def run_forever(self):
-        log("boot", version="2.1.0-agent", pid=os.getpid())
+        log("boot", version="3.0.0-agent", pid=os.getpid())
         while True:
             try:
                 self.tick()

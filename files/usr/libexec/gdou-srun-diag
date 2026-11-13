@@ -20,6 +20,9 @@ hr() { echo "------------------------------------------------------------"; }
 FIXED_LINK=0
 dmesg 2>/dev/null | grep -q "fixed/.*base-x" && FIXED_LINK=1
 
+OUT=/tmp/gdou-diag.txt
+
+gen() {
 echo "======= luci-app-gdou-srun 诊断包 ======="
 echo "生成时间 : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "主机名   : $(cat /proc/sys/kernel/hostname 2>/dev/null)"
@@ -90,18 +93,18 @@ else
 	echo "           恢复命令： /usr/libexec/gdou-srun-mac restore"
 fi
 
-# 收包活性：5 秒内 rx 是否增长
+# 收包活性：3 秒内 rx 是否增长（断网时这一步也会占用时间，尽量短）
 r1=$(cat /sys/class/net/eth0/statistics/rx_packets 2>/dev/null || echo 0)
-sleep 5
+sleep 3
 r2=$(cat /sys/class/net/eth0/statistics/rx_packets 2>/dev/null || echo 0)
-echo "收包活性 : eth0 5 秒内 +$((r2 - r1)) 包"
+echo "收包活性 : eth0 3 秒内 +$((r2 - r1)) 包"
 if [ $((r2 - r1)) -gt 0 ]; then
 	echo "           链路有数据进来（正常）"
 elif [ "$FIXED_LINK" = "1" ]; then
-	echo "           ** 5 秒零收包：网线没插好、墙口无信号，或交换机不转发 **"
+	echo "           ** 3 秒零收包：网线没插好、墙口无信号，或交换机不转发 **"
 	echo "           （本机 eth0 是固定 2500base-x 链路，carrier 恒为 1，不能作为判断依据）"
 else
-	echo "           ** 5 秒零收包：对端不发数据，端口可能被交换机禁用 **"
+	echo "           ** 3 秒零收包：对端不发数据，端口可能被交换机禁用 **"
 fi
 echo
 
@@ -164,13 +167,32 @@ echo "暂停标记 : $([ -f /tmp/gdou-srun.pause ] && echo 有（主链路被下
 echo
 
 echo "--- 认证状态 ---"
-printf 'check    : '
-if /usr/libexec/gdou-srun check >/dev/null 2>&1; then echo "在线"; else echo "离线"; fi
+# 只查一次门户，从返回体判断状态。
+# 早期版本这里还调用了 gdou-srun check，它内部会串行做「门户(6s)+HTTP(4s)+TCP(3s)」
+# 三次探测，断网时要等 13 秒，整个诊断包因此超时下载不下来。
 srv=$(g server)
 host=$(echo "${srv:-http://10.129.1.1}" | sed 's|^[a-z]*://||; s|/.*||; s|:.*||')
-printf '门户 %-14s : ' "$host"
-wget -qO- -T 6 "http://$host/cgi-bin/rad_user_info?callback=sdu" 2>/dev/null | head -c 240
-echo
+# 用 python 探测：busybox 的 wget -T 不限制 TCP 连接阶段，
+# 断网时内核 SYN 重试会拖到 100 秒以上，整个诊断包因此下载超时。
+pbody=$(python3 -c '
+import sys, urllib.request
+try:
+    r = urllib.request.urlopen("http://%s/cgi-bin/rad_user_info?callback=sdu" % sys.argv[1], timeout=4)
+    sys.stdout.write(r.read(400).decode("utf-8", "replace"))
+except Exception as exc:
+    sys.stdout.write("__ERR__%s" % str(exc)[:80])
+' "$host")
+case "$pbody" in
+	__ERR__*)                    pst="门户不可达（链路或门户故障）" ;;
+	*'"error":"ok"'*)            pst="在线" ;;
+	*speed_limit_error*)         pst="在线（限速套餐）" ;;
+	*not_online_error*)          pst="离线（门户显示未认证）" ;;
+	"")                          pst="门户不可达（链路或门户故障）" ;;
+	*)                           pst="未知" ;;
+esac
+printf 'ac_id记录: %s\n' "$(cat /tmp/gdou-srun.acid 2>/dev/null || echo '（无，重启后自动发现）')"
+printf '门户状态 : %s\n' "$pst"
+printf '门户原文 : %s\n' "$pbody"
 echo
 
 hr
@@ -189,3 +211,8 @@ hr
 logread 2>/dev/null | grep -iE "gdou|eth0|wan|udhcpc|dhcp" | tail -n 40
 echo
 echo "======= 诊断包结束 ======="
+}
+
+# tee 同时输出到 stdout 和文件：前端 fs.exec 超时也能通过 fs.read 拿到内容
+gen 2>&1 | tee "$OUT" >/dev/null
+cat "$OUT" 2>/dev/null || true

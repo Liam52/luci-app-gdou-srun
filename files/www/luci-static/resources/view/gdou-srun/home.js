@@ -434,13 +434,22 @@ return view.extend({
 					diagBtn.textContent = '正在收集…';
 					if (diagMsg) {
 						diagMsg.style.color = '';
-						diagMsg.textContent = '正在收集配置、接口、路由和日志（约 10 秒）…';
+						diagMsg.textContent = '正在收集配置、接口、路由和日志（约 6 秒，断网时稍久）…';
 					}
 
+					/* 先执行脚本，再兜底读取落盘文件。
+					 * 断网时诊断脚本要等门户探测超时，fs.exec 可能先超时；
+					 * 脚本本身会把内容写到 /tmp/gdou-diag.txt，这里补一次读取。 */
 					fs.exec('/usr/libexec/gdou-srun-diag', []).then(function (res) {
 						var text = (res && res.stdout) || '';
-						if (!text) {
-							throw new Error('诊断脚本没有输出');
+						if (text.length > 200 && text.indexOf('诊断包') >= 0)
+							return text;
+						return fs.read('/tmp/gdou-diag.txt');
+					}).catch(function () {
+						return fs.read('/tmp/gdou-diag.txt');
+					}).then(function (text) {
+						if (!text || text.length < 50) {
+							throw new Error('诊断内容为空');
 						}
 						var name = 'gdou-diag-' + stamp() + '.txt';
 						var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
