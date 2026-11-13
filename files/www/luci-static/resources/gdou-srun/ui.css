@@ -1,0 +1,788 @@
+/* luci-app-gdou-srun 统一视觉样式
+ *
+ * 只用 .gd- 前缀，不覆盖 LuCI / Argon 自身的类。
+ * 深浅色同时适配：系统深色（prefers-color-scheme）和 Argon 的深色主题（body.dark / html.dark）。
+ */
+
+:root {
+	--gd-surface: #ffffff;
+	--gd-surface-2: #f6f8fb;
+	--gd-border: rgba(16, 24, 40, .09);
+	--gd-border-strong: rgba(16, 24, 40, .16);
+	--gd-text: #1f2937;
+	--gd-sub: #6b7280;
+	--gd-faint: rgba(16, 24, 40, .58);
+	--gd-accent: #2a76c9;
+	--gd-accent-soft: rgba(42, 118, 201, .10);
+	--gd-ok: #16a34a;
+	--gd-ok-soft: rgba(22, 163, 74, .12);
+	--gd-warn: #d97706;
+	--gd-warn-soft: rgba(217, 119, 6, .12);
+	--gd-bad: #dc2626;
+	--gd-bad-soft: rgba(220, 38, 38, .10);
+	--gd-shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 12px 32px -18px rgba(16, 24, 40, .22);
+	--gd-shadow-sm: 0 1px 2px rgba(16, 24, 40, .05);
+	--gd-radius: 12px;
+	--gd-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--gd-surface: rgba(255, 255, 255, .045);
+		--gd-surface-2: rgba(255, 255, 255, .03);
+		--gd-border: rgba(255, 255, 255, .10);
+		--gd-border-strong: rgba(255, 255, 255, .18);
+		--gd-text: #e8ecf3;
+		--gd-sub: #9aa4b2;
+		--gd-faint: rgba(232, 236, 243, .62);
+		--gd-accent: #6eaef0;
+		--gd-accent-soft: rgba(110, 174, 240, .14);
+		--gd-ok: #4ade80;
+		--gd-ok-soft: rgba(74, 222, 128, .14);
+		--gd-warn: #f0b95f;
+		--gd-warn-soft: rgba(240, 185, 95, .14);
+		--gd-bad: #f2796f;
+		--gd-bad-soft: rgba(242, 121, 111, .14);
+		--gd-shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 16px 40px -22px rgba(0, 0, 0, .7);
+		--gd-shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
+	}
+}
+
+/* Argon 手动切深色时也跟上 */
+body.dark,
+html.dark,
+body[data-darkmode="true"] {
+	--gd-surface: rgba(255, 255, 255, .045);
+	--gd-surface-2: rgba(255, 255, 255, .03);
+	--gd-border: rgba(255, 255, 255, .10);
+	--gd-border-strong: rgba(255, 255, 255, .18);
+	--gd-text: #e8ecf3;
+	--gd-sub: #9aa4b2;
+	--gd-faint: rgba(232, 236, 243, .62);
+	--gd-accent: #6eaef0;
+	--gd-accent-soft: rgba(110, 174, 240, .14);
+	--gd-ok: #4ade80;
+	--gd-ok-soft: rgba(74, 222, 128, .14);
+	--gd-warn: #f0b95f;
+	--gd-warn-soft: rgba(240, 185, 95, .14);
+	--gd-bad: #f2796f;
+	--gd-bad-soft: rgba(242, 121, 111, .14);
+	--gd-shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 16px 40px -22px rgba(0, 0, 0, .7);
+}
+
+/* ---------------- 布局 ---------------- */
+
+.gd-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 14px;
+	margin: 2px 0 14px;
+}
+
+@media (max-width: 760px) {
+	.gd-grid { grid-template-columns: 1fr; }
+}
+
+.gd-card {
+	background: var(--gd-surface);
+	border: 1px solid var(--gd-border);
+	border-radius: var(--gd-radius);
+	box-shadow: var(--gd-shadow);
+	padding: 18px 20px;
+	margin: 0 0 14px;
+	transition: box-shadow .18s ease, border-color .18s ease;
+}
+
+.gd-card:hover {
+	border-color: var(--gd-border-strong);
+}
+
+.gd-card.gd-hero {
+	grid-column: 1 / -1;
+	display: flex;
+	align-items: center;
+	gap: 16px;
+	background:
+		linear-gradient(135deg, var(--gd-accent-soft), transparent 62%),
+		var(--gd-surface);
+}
+
+/* ---------------- 状态 ---------------- */
+
+.gd-dot {
+	width: 11px;
+	height: 11px;
+	border-radius: 50%;
+	flex: none;
+	background: var(--gd-sub);
+	transition: background .2s ease;
+}
+
+.gd-dot.on {
+	background: var(--gd-ok);
+	animation: gd-pulse 2.4s ease-out infinite;
+}
+
+.gd-dot.off {
+	background: var(--gd-bad);
+}
+
+@keyframes gd-pulse {
+	0%   { box-shadow: 0 0 0 0 rgba(22, 163, 74, .42); }
+	70%  { box-shadow: 0 0 0 11px rgba(22, 163, 74, 0); }
+	100% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0); }
+}
+
+.gd-big {
+	font-size: 21px;
+	font-weight: 650;
+	line-height: 1.2;
+	letter-spacing: -.01em;
+	color: var(--gd-text);
+}
+
+.gd-meta {
+	font-size: 12.5px;
+	color: var(--gd-sub);
+	margin-top: 3px;
+}
+
+.gd-right {
+	margin-left: auto;
+	text-align: right;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 4px;
+}
+
+.gd-mono {
+	font-family: var(--gd-mono);
+	font-size: 12.6px;
+	font-variant-numeric: tabular-nums;
+	color: var(--gd-text);
+}
+
+.gd-mini {
+	font-size: 11.8px;
+	color: var(--gd-faint);
+}
+
+/* ---------------- 标题 ---------------- */
+
+.gd-h {
+	font-size: 12.2px;
+	font-weight: 650;
+	color: var(--gd-sub);
+	margin: 0 0 12px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	letter-spacing: .02em;
+}
+
+.gd-h::before {
+	content: "";
+	width: 3px;
+	height: 13px;
+	border-radius: 2px;
+	background: var(--gd-accent);
+	opacity: .85;
+	flex: none;
+}
+
+.gd-sect {
+	margin: 18px 0 10px;
+	padding: 11px 14px;
+	border-radius: 10px;
+	background: var(--gd-surface-2);
+	border: 1px solid var(--gd-border);
+	border-left: 3px solid var(--gd-accent);
+}
+
+.gd-sect:first-child { margin-top: 2px; }
+
+.gd-sect .gd-h { margin-bottom: 4px; }
+
+.gd-sect .gd-h::before { display: none; }
+
+.gd-sub {
+	font-size: 12.4px;
+	font-weight: 650;
+	color: var(--gd-text);
+	margin: 16px 0 6px;
+	padding-bottom: 6px;
+	border-bottom: 1px dashed var(--gd-border);
+}
+
+.gd-sub:first-child { margin-top: 0; }
+
+/* ---------------- 键值表 ---------------- */
+
+.gd-kv {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 7px 16px;
+	font-size: 12.9px;
+	margin: 0;
+}
+
+.gd-kv dt {
+	color: var(--gd-sub);
+	white-space: nowrap;
+}
+
+.gd-kv dd {
+	margin: 0;
+	font-family: var(--gd-mono);
+	font-size: 12.4px;
+	color: var(--gd-text);
+	font-variant-numeric: tabular-nums;
+	word-break: break-all;
+}
+
+/* ---------------- 按钮 ---------------- */
+
+.gd-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 5px;
+	padding: 9px 18px;
+	min-height: 38px;
+	border-radius: 9px;
+	border: 1px solid var(--gd-border-strong);
+	background: var(--gd-surface);
+	color: var(--gd-text);
+	font-size: 13.4px;
+	font-weight: 600;
+	cursor: pointer;
+	white-space: nowrap;
+	line-height: 1.4;
+	transition: transform .12s ease, box-shadow .16s ease,
+		border-color .16s ease, background .16s ease, color .16s ease;
+	box-shadow: var(--gd-shadow-sm);
+}
+
+.gd-btn:hover {
+	border-color: var(--gd-accent);
+	color: var(--gd-accent);
+	transform: translateY(-1px);
+	box-shadow: 0 4px 14px -6px rgba(42, 118, 201, .45);
+}
+
+.gd-btn:active {
+	transform: translateY(0);
+	box-shadow: none;
+}
+
+.gd-btn:disabled {
+	opacity: .55;
+	cursor: default;
+	transform: none;
+	box-shadow: none;
+}
+
+.gd-btn.gd-p {
+	background: linear-gradient(180deg, rgba(255, 255, 255, .16), transparent), var(--gd-accent);
+	border-color: transparent;
+	color: #fff;
+	box-shadow: 0 4px 14px -8px rgba(42, 118, 201, .9);
+}
+
+.gd-btn.gd-p:hover {
+	color: #fff;
+	filter: brightness(1.06);
+}
+
+.gd-btn.gd-d {
+	color: var(--gd-bad);
+	border-color: var(--gd-bad-soft);
+}
+
+.gd-btn.gd-d:hover {
+	border-color: var(--gd-bad);
+	color: var(--gd-bad);
+	box-shadow: 0 4px 14px -8px rgba(220, 38, 38, .55);
+}
+
+.gd-btn.gd-sm {
+	padding: 7px 14px;
+	min-height: 32px;
+	font-size: 12.6px;
+	border-radius: 8px;
+}
+
+.gd-row {
+	display: flex;
+	gap: 10px;
+	flex-wrap: wrap;
+}
+
+/* ---------------- 表格 ---------------- */
+
+.gd-tbl {
+	width: 100%;
+	border-collapse: separate;
+	border-spacing: 0;
+	font-size: 12.7px;
+}
+
+.gd-tbl th {
+	text-align: left;
+	font-weight: 600;
+	color: var(--gd-sub);
+	font-size: 11.2px;
+	letter-spacing: .04em;
+	text-transform: uppercase;
+	padding: 0 12px 9px;
+	border-bottom: 1px solid var(--gd-border);
+	white-space: nowrap;
+}
+
+.gd-tbl td {
+	padding: 11px 12px;
+	border-bottom: 1px solid var(--gd-border);
+	vertical-align: middle;
+	color: var(--gd-text);
+}
+
+.gd-tbl tbody tr {
+	transition: background .14s ease;
+}
+
+.gd-tbl tbody tr:hover {
+	background: var(--gd-surface-2);
+}
+
+.gd-tbl tr:last-child td { border-bottom: 0; }
+
+.gd-tbl td.gd-num {
+	font-family: var(--gd-mono);
+	font-variant-numeric: tabular-nums;
+}
+
+/* ---------------- 徽标 ---------------- */
+
+.gd-b {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	padding: 2px 9px;
+	border-radius: 20px;
+	font-size: 11.4px;
+	font-weight: 600;
+	white-space: nowrap;
+	border: 1px solid transparent;
+}
+
+.gd-b::before {
+	content: "";
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: currentColor;
+	flex: none;
+}
+
+.gd-b-ok {
+	background: var(--gd-ok-soft);
+	color: var(--gd-ok);
+	border-color: rgba(22, 163, 74, .22);
+}
+
+.gd-b-warn {
+	background: var(--gd-warn-soft);
+	color: var(--gd-warn);
+	border-color: rgba(217, 119, 6, .22);
+}
+
+.gd-b-bad {
+	background: var(--gd-bad-soft);
+	color: var(--gd-bad);
+	border-color: rgba(220, 38, 38, .22);
+}
+
+.gd-b-off {
+	background: var(--gd-surface-2);
+	color: var(--gd-sub);
+	border-color: var(--gd-border);
+}
+
+.gd-b-off::before { opacity: .5; }
+
+/* ---------------- 提示 ---------------- */
+
+.gd-note {
+	font-size: 11.9px;
+	color: var(--gd-faint);
+	margin: 9px 0 0;
+	line-height: 1.7;
+}
+
+.gd-alert {
+	padding: 11px 14px;
+	border-radius: 10px;
+	font-size: 12.6px;
+	line-height: 1.7;
+	margin: 0 0 14px;
+	border: 1px solid transparent;
+}
+
+.gd-alert-warn {
+	background: var(--gd-warn-soft);
+	color: var(--gd-warn);
+	border-color: rgba(217, 119, 6, .26);
+}
+
+.gd-alert-danger {
+	background: var(--gd-bad-soft);
+	color: var(--gd-bad);
+	border-color: rgba(220, 38, 38, .26);
+}
+
+.gd-alert-info {
+	background: var(--gd-accent-soft);
+	color: var(--gd-accent);
+	border-color: rgba(42, 118, 201, .26);
+}
+
+/* ---------------- 折叠 ---------------- */
+
+details.gd-fold {
+	border: 1px solid var(--gd-border);
+	border-radius: 10px;
+	background: var(--gd-surface-2);
+	margin: 0 0 14px;
+	overflow: hidden;
+	transition: border-color .18s ease;
+}
+
+details.gd-fold:hover { border-color: var(--gd-border-strong); }
+
+details.gd-fold > summary {
+	padding: 11px 15px;
+	cursor: pointer;
+	font-size: 12.6px;
+	font-weight: 600;
+	color: var(--gd-sub);
+	list-style: none;
+	user-select: none;
+	transition: color .16s ease;
+}
+
+details.gd-fold > summary::-webkit-details-marker { display: none; }
+
+details.gd-fold > summary::before {
+	content: "▸";
+	display: inline-block;
+	margin-right: 7px;
+	opacity: .6;
+	transition: transform .18s ease;
+}
+
+details.gd-fold[open] > summary::before {
+	transform: rotate(90deg);
+}
+
+details.gd-fold[open] > summary {
+	color: var(--gd-text);
+	border-bottom: 1px solid var(--gd-border);
+}
+
+details.gd-fold .gd-foldbody {
+	padding: 12px 15px 14px;
+	font-size: 12.4px;
+	line-height: 1.85;
+	color: var(--gd-faint);
+}
+
+/* ---------------- 输出区 ---------------- */
+
+.gd-pre {
+	white-space: pre-wrap;
+	word-break: break-all;
+	font-family: var(--gd-mono);
+	font-size: 11.5px;
+	margin: 10px 0 0;
+	padding: 10px 12px;
+	border-radius: 8px;
+	background: var(--gd-surface-2);
+	border: 1px solid var(--gd-border);
+	color: var(--gd-faint);
+	max-height: 200px;
+	overflow: auto;
+	line-height: 1.6;
+}
+
+.gd-pre:empty { display: none; }
+
+/* ---------------- 设置页分区标题（原生表单里的）---------------- */
+
+.gd-sect-title {
+	font-size: 12.4px;
+	font-weight: 650;
+	color: var(--gd-sub);
+	letter-spacing: .02em;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 20px 0 8px;
+	padding-bottom: 8px;
+	border-bottom: 1px solid var(--gd-border);
+}
+
+.gd-sect-title::before {
+	content: "";
+	width: 3px;
+	height: 13px;
+	border-radius: 2px;
+	background: var(--gd-accent);
+	opacity: .85;
+	flex: none;
+}
+
+.gd-sect-title:first-child { margin-top: 2px; }
+/* ============================================================
+ * 页面作用域：统一 LuCI / Argon 原生表单控件的观感
+ * 只有加了 .gd-page 的页面受影响，不污染其它菜单。
+ * ============================================================ */
+
+.gd-page .cbi-section,
+.gd-page .cbi-map {
+	background: transparent;
+}
+
+.gd-page .cbi-value {
+	padding: 11px 0;
+	border-bottom: 1px dashed var(--gd-border);
+	display: flex;
+	align-items: flex-start;
+	gap: 14px;
+}
+
+.gd-page .cbi-value:last-of-type {
+	border-bottom: 0;
+}
+
+.gd-page .cbi-value-title {
+	width: 190px;
+	flex: none;
+	color: var(--gd-sub);
+	font-size: 12.9px;
+	line-height: 1.5;
+	padding-top: 2px;
+}
+
+.gd-page .cbi-value-field {
+	flex: 1;
+	min-width: 0;
+}
+
+.gd-page .cbi-value-description {
+	color: var(--gd-faint);
+	font-size: 11.9px;
+	line-height: 1.65;
+	margin-top: 5px;
+}
+
+/* 输入框 / 下拉框 */
+.gd-page input[type="text"],
+.gd-page input[type="password"],
+.gd-page input[type="number"],
+.gd-page select,
+.gd-page textarea {
+	background: var(--gd-surface-2);
+	border: 1px solid var(--gd-border-strong);
+	border-radius: 8px;
+	padding: 9px 12px;
+	min-height: 38px;
+	font-size: 13.4px;
+	color: var(--gd-text);
+	max-width: 100%;
+	transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+	box-shadow: none;
+}
+
+.gd-page input[type="text"]:focus,
+.gd-page input[type="password"]:focus,
+.gd-page input[type="number"]:focus,
+.gd-page select:focus,
+.gd-page textarea:focus {
+	border-color: var(--gd-accent);
+	background: var(--gd-surface);
+	box-shadow: 0 0 0 3px var(--gd-accent-soft);
+	outline: none;
+}
+
+/* 开关式复选框（LuCI 的 Flag）稍微放大一点更好点 */
+.gd-page input[type="checkbox"] {
+	width: 16px;
+	height: 16px;
+	accent-color: var(--gd-accent);
+	cursor: pointer;
+	vertical-align: -2px;
+}
+
+/* 原生按钮 / 保存条 */
+.gd-page .cbi-button,
+.gd-page .btn {
+	border-radius: 9px;
+	border: 1px solid var(--gd-border-strong);
+	padding: 9px 17px;
+	min-height: 38px;
+	font-size: 13.2px;
+	font-weight: 600;
+	transition: transform .12s ease, box-shadow .16s ease,
+		border-color .16s ease, color .16s ease, background .16s ease;
+	box-shadow: var(--gd-shadow-sm);
+}
+
+.gd-page .cbi-button:hover,
+.gd-page .btn:hover {
+	border-color: var(--gd-accent);
+	color: var(--gd-accent);
+	transform: translateY(-1px);
+}
+
+.gd-page .cbi-button-apply,
+.gd-page .cbi-button-action.apply {
+	background: var(--gd-accent);
+	border-color: transparent;
+	color: #fff;
+}
+
+.gd-page .cbi-button-apply:hover {
+	color: #fff;
+	filter: brightness(1.06);
+}
+
+.gd-page .cbi-button-reset,
+.gd-page .cbi-button-negative {
+	border-color: var(--gd-bad-soft);
+	color: var(--gd-bad);
+}
+
+.gd-page .cbi-button-reset:hover,
+.gd-page .cbi-button-negative:hover {
+	border-color: var(--gd-bad);
+	color: var(--gd-bad);
+}
+
+/* 底部保存/应用条 */
+.gd-page .cbi-page-actions {
+	margin-top: 22px;
+	padding-top: 16px;
+	border-top: 1px solid var(--gd-border);
+	display: flex;
+	gap: 10px;
+	justify-content: flex-end;
+}
+
+/* 折叠区里的原生行更紧凑 */
+.gd-page details .cbi-value {
+	padding: 8px 0;
+}
+
+/* 错误提示 */
+.gd-page .cbi-input-invalid,
+.gd-page .cbi-value-error input,
+.gd-page .cbi-value-error select {
+	border-color: var(--gd-bad) !important;
+	box-shadow: 0 0 0 3px var(--gd-bad-soft);
+}
+
+@media (max-width: 760px) {
+	.gd-page .cbi-value {
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.gd-page .cbi-value-title {
+		width: auto;
+		padding-top: 0;
+	}
+}
+
+/* ============================================================
+ * 撑满内容区
+ * DummyValue 的标签为 null 时，LuCI 仍会保留标签列（约占 1/3 宽），
+ * 导致自定义区块只用到 2/3 的宽度。下面把空标签列隐藏，字段占满。
+ * ============================================================ */
+
+.gd-page .cbi-value > .cbi-value-title:empty {
+	display: none !important;
+}
+
+.gd-page .cbi-value {
+	width: 100%;
+	max-width: none;
+	align-items: stretch;
+}
+
+.gd-page .cbi-value > .cbi-value-field {
+	width: 100% !important;
+	max-width: 100% !important;
+	flex: 1 1 auto !important;
+	min-width: 0;
+}
+
+/* 表格与自定义块都撑满 */
+.gd-page .cbi-section,
+.gd-page .cbi-section-node,
+.gd-page .cbi-section-table,
+.gd-page .cbi-section-table-row,
+.gd-page .cbi-section-table-cell,
+.gd-page table.table {
+	width: 100% !important;
+	max-width: none !important;
+}
+
+.gd-page .gd-grid,
+.gd-page .gd-card,
+.gd-page .gd-tbl,
+.gd-page .gd-sect {
+	width: 100%;
+	max-width: none;
+	box-sizing: border-box;
+}
+
+/* 表格单元格里的自定义块不要被内边距挤窄 */
+.gd-page .cbi-section-table-cell {
+	padding-left: 0;
+	padding-right: 0;
+}
+
+.gd-page .cbi-section-table-cell > .cbi-value {
+	padding-left: 0;
+	padding-right: 0;
+}
+
+/* 标签为空的区块行：压掉 Argon 那 23rem 的标签列 */
+.gd-page .cbi-value.gd-full {
+	display: block !important;
+	padding: 0 0 6px 0 !important;
+	line-height: 1.55 !important;
+}
+
+.gd-page .cbi-value.gd-full > .cbi-value-title {
+	display: none !important;
+	float: none !important;
+	width: 0 !important;
+}
+
+.gd-page .cbi-value.gd-full > .cbi-value-field {
+	display: block !important;
+	float: none !important;
+	width: 100% !important;
+	max-width: 100% !important;
+	margin: 0 !important;
+	padding: 0 !important;
+}
+
+/* 区块所在的容器也别留左右内边距 */
+.gd-page .cbi-section-node > .cbi-value.gd-full,
+.gd-page .cbi-section-table-cell > .cbi-value.gd-full {
+	padding-left: 0 !important;
+	padding-right: 0 !important;
+}

@@ -4,11 +4,11 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-gdou-srun
-PKG_VERSION:=2.0.0
+PKG_VERSION:=2.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
-PKG_MAINTAINER:=luci-app-gdou-srun contributors
+PKG_MAINTAINER:=Liam52 <https://github.com/Liam52>
 
 LUCI_TITLE:=GDou campus network (srun) auto login
 LUCI_DESCRIPTION:=Automatically authenticate to the Guangdong Ocean University campus network (srun).

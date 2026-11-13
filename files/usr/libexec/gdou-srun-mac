@@ -131,12 +131,36 @@ except Exception:
     sys.exit(1)' "$h" 2>/dev/null
 }
 
+# 设置 network 里 config device 段的 MAC。
+#
+# 有些固件（例如本机）在 /etc/config/network 里用
+#   config device
+#       option name 'eth0'
+#       option macaddr 'xx:xx:...'
+# 固定了网口 MAC，它的优先级**高于** interface 上的 macaddr。
+# 只改 interface 的话，重启后会回到 device 段的值，看起来像"改了没用"。
+dev_mac_set() {
+	_dev=$1
+	_mac=$2
+	_i=0
+	while uci -q get "network.@device[$_i]" >/dev/null 2>&1; do
+		if [ "$(uci -q get "network.@device[$_i].name")" = "$_dev" ]; then
+			uci set "network.@device[$_i].macaddr=$_mac"
+			return 0
+		fi
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
 # 改 MAC 并等 DHCP 拿到地址（不含任何判断，供 apply_mac 复用）
 set_mac_dhcp() {
 	newmac=$1
 	dev=$(wan_dev)
 
 	uci set "network.wan.macaddr=$newmac"
+	# device 段若有同名设备也要改，否则重启后被它覆盖
+	dev_mac_set "$dev" "$newmac" || true
 	uci commit network
 
 	ifdown wan >/dev/null 2>&1
@@ -189,6 +213,7 @@ apply_mac() {
 		echo "换 MAC 后门户不可达，判断触发了端口安全（MAC 绑定），正在恢复原始 MAC $orig" >&2
 		set_mac_dhcp "$orig"
 		uci set "network.wan.macaddr=$orig" 2>/dev/null || true
+		dev_mac_set "$dev" "$orig" || true
 		uci commit network 2>/dev/null || true
 		now=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
 		ipv4=$(ip -4 addr show dev "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
@@ -207,6 +232,14 @@ case "$1" in
 		echo "当前 MAC: $(cur_mac)"
 		echo "原始 MAC: $(uci -q get "$KEY.mac_origin")"
 		echo "uci macaddr: $(uci -q get network.wan.macaddr)"
+	_d=0
+	while uci -q get "network.@device[$_d]" >/dev/null 2>&1; do
+		if [ "$(uci -q get "network.@device[$_d].name")" = "$(wan_dev)" ]; then
+			echo "device macaddr: $(uci -q get "network.@device[$_d].macaddr")  ← 优先级更高"
+			break
+		fi
+		_d=$((_d + 1))
+	done
 		echo "模式: $(uci -q get "$KEY.mac_mode")"
 		echo "MAC 池: $(uci -q get "$KEY.mac_pool")"
 		;;

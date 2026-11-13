@@ -32,7 +32,8 @@ fi
 say "==> 创建目录"
 mkdir -p "$ROOT/etc/config" "$ROOT/etc/init.d" "$ROOT/etc/hotplug.d/iface" \
 	"$ROOT/usr/libexec" "$ROOT/usr/share/luci/menu.d" "$ROOT/usr/share/rpcd/acl.d" \
-	"$ROOT/www/luci-static/resources/view/gdou-srun"
+	"$ROOT/www/luci-static/resources/view/gdou-srun" \
+	"$ROOT/www/luci-static/resources/gdou-srun"
 
 # ---------- 3. 配置文件（不覆盖已有）----------
 if [ -f "$ROOT/etc/config/gdou-srun" ]; then
@@ -54,7 +55,8 @@ fi
 # ---------- 4. 程序与视图 ----------
 say "==> 复制程序"
 for f in gdou-srun gdou-srun-apply gdou-srun-daemon gdou-srun-devices \
-         gdou-srun-dual gdou-srun-mac gdou-srun-split gdou-srun-status; do
+         gdou-srun-dual gdou-srun-mac gdou-srun-split gdou-srun-status \
+         gdou-srun-diag gdou-srun-agent; do
 	cp -f "$SRC/files/usr/libexec/$f" "$ROOT/usr/libexec/$f"
 	chmod 755 "$ROOT/usr/libexec/$f"
 done
@@ -63,6 +65,10 @@ say "==> 复制 LuCI 视图"
 cp -f "$SRC/files/www/luci-static/resources/view/gdou-srun/home.js"     "$ROOT/www/luci-static/resources/view/gdou-srun/home.js"
 cp -f "$SRC/files/www/luci-static/resources/view/gdou-srun/settings.js" "$ROOT/www/luci-static/resources/view/gdou-srun/settings.js"
 cp -f "$SRC/files/www/luci-static/resources/view/gdou-srun/advanced.js" "$ROOT/www/luci-static/resources/view/gdou-srun/advanced.js"
+
+say "==> 复制样式表"
+cp -f "$SRC/files/www/luci-static/resources/gdou-srun/ui.css" \
+	"$ROOT/www/luci-static/resources/gdou-srun/ui.css"
 
 say "==> 复制菜单与权限"
 cp -f "$SRC/files/usr/share/luci/menu.d/luci-app-gdou-srun.json" "$ROOT/usr/share/luci/menu.d/luci-app-gdou-srun.json"

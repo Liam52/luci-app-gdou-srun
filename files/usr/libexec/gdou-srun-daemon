@@ -169,6 +169,69 @@ while :; do
 		continue
 	fi
 
+	# ---- 按配置同步 IPv6（三档）----
+	#   off    : wan6 关闭 + LAN 不发路由通告
+	#   campus : wan6 开启 + LAN 发地址但不下发默认路由（IPv6 只走校内）
+	#   full   : wan6 开启 + 正常下发 IPv6 默认路由（需要外网也有 IPv6）
+	# 每 30 秒核对一次，配置没变就不动，避免反复 commit/重启服务。
+	if [ $((now - LAST_IPV6)) -ge 30 ]; then
+		LAST_IPV6=$now
+		mode=$(uci -q get gdou-srun.gdou_srun.ipv6_mode)
+		# 兼容旧字段 ipv6=1
+		if [ -z "$mode" ] && [ "$(uci -q get gdou-srun.gdou_srun.ipv6)" = "1" ]; then
+			mode=full
+		fi
+		[ -z "$mode" ] && mode=off
+
+		# --- WAN 侧 wan6 ---
+		if uci -q get network.wan6 >/dev/null 2>&1; then
+			dis=$(uci -q get network.wan6.disabled)
+			if [ "$mode" = "off" ]; then
+				if [ "$dis" != "1" ]; then
+					uci -q set network.wan6.disabled='1'
+					uci -q commit network
+					/sbin/ifdown wan6 >/dev/null 2>&1
+					log "IPv6 已关闭（wan6）"
+				fi
+			else
+				if [ "$dis" = "1" ]; then
+					uci -q set network.wan6.disabled='0'
+					uci -q commit network
+					/sbin/ifup wan6 >/dev/null 2>&1
+					log "IPv6 已启用（wan6，模式 $mode）"
+				fi
+			fi
+		fi
+
+		# --- LAN 侧路由通告 ---
+		if uci -q get dhcp.lan >/dev/null 2>&1; then
+			ra=$(uci -q get dhcp.lan.ra)
+			rad=$(uci -q get dhcp.lan.ra_default)
+			changed=0
+			if [ "$mode" = "off" ]; then
+				[ "$ra" != "disabled" ] && { uci -q set dhcp.lan.ra='disabled'; changed=1; }
+				[ "$(uci -q get dhcp.lan.dhcpv6)" != "disabled" ] && { uci -q set dhcp.lan.dhcpv6='disabled'; changed=1; }
+			elif [ "$mode" = "campus" ]; then
+				# 发地址、不发默认路由
+				[ "$ra" != "server" ] && { uci -q set dhcp.lan.ra='server'; changed=1; }
+				[ "$rad" != "0" ] && { uci -q set dhcp.lan.ra_default='0'; changed=1; }
+				uci -q get network.lan.ip6assign >/dev/null 2>&1 || { uci -q set network.lan.ip6assign='60'; uci -q commit network; }
+			else
+				[ "$ra" != "server" ] && { uci -q set dhcp.lan.ra='server'; changed=1; }
+				[ "$rad" != "1" ] && { uci -q set dhcp.lan.ra_default='1'; changed=1; }
+			fi
+			if [ "$changed" = "1" ]; then
+				uci -q commit dhcp
+				/etc/init.d/odhcpd restart >/dev/null 2>&1
+				case "$mode" in
+				off) log "已关闭 LAN IPv6 路由通告" ;;
+				campus) log "LAN IPv6 已切换为「仅内网」，不下发默认路由" ;;
+				full) log "LAN IPv6 已切换为「完整」，正常下发默认路由" ;;
+				esac
+			fi
+		fi
+	fi
+
 	# ---- 网络备份模式：主链路掉线就把局域网切到第二链路 ----
 	SMODE=$(uci -q get gdou-srun.gdou_srun.split_mode)
 	BK_MARK=/tmp/gdou-backup.on
@@ -178,12 +241,26 @@ while :; do
 	if [ $((now - LAST_CHECK)) -ge "$CHECK_GAP" ]; then
 		if /usr/libexec/gdou-srun check >/dev/null 2>&1; then
 			LAST_ONLINE=1
+	PREV_ONLINE=1
+	LAST_IPV6=0
 		else
 			LAST_ONLINE=0
 		fi
 		LAST_CHECK=$now
 	fi
 	ONLINE=$LAST_ONLINE
+
+	# 状态翻转单独记一笔。
+	# 掉线本身就是用户最想知道的事，但守护进程以前只在"执行登录动作"时写日志，
+	# 短暂的掉线/恢复（不需要重新登录）完全不会留痕，事后无从查起。
+	if [ "$ONLINE" != "$PREV_ONLINE" ]; then
+		if [ "$ONLINE" = "0" ]; then
+			log "状态变化：在线 -> 离线（门户未认证或链路不通）"
+		else
+			log "状态变化：离线 -> 在线"
+		fi
+		PREV_ONLINE=$ONLINE
+	fi
 
 	if [ "$SMODE" = "backup" ] && [ -e /sys/class/net/mcv0 ]; then
 		if [ "$ONLINE" = "1" ]; then

@@ -29,8 +29,11 @@ usr/libexec/gdou-srun-dual
 usr/libexec/gdou-srun-mac
 usr/libexec/gdou-srun-split
 usr/libexec/gdou-srun-status
+usr/libexec/gdou-srun-diag
+usr/libexec/gdou-srun-agent
 usr/share/luci/menu.d/luci-app-gdou-srun.json
 usr/share/rpcd/acl.d/luci-app-gdou-srun.json
+www/luci-static/resources/gdou-srun/ui.css
 www/luci-static/resources/view/gdou-srun/home.js
 www/luci-static/resources/view/gdou-srun/settings.js
 www/luci-static/resources/view/gdou-srun/advanced.js
@@ -41,7 +44,7 @@ www/luci-static/resources/view/gdou-srun/advanced.js
 #!/bin/sh
 # luci-app-gdou-srun —— 单文件安装脚本（自动生成，请勿手动编辑）
 #
-# 源码与生成方式：https://github.com/<你的用户名>/luci-app-gdou-srun
+# 源码与生成方式：https://github.com/Liam52/luci-app-gdou-srun
 #   由 tools/make-single-file.sh 生成
 #
 # 用法：
@@ -66,7 +69,7 @@ command -v python3 >/dev/null 2>&1 || {
 echo "==> 创建目录"
 mkdir -p /etc/config /etc/init.d /etc/hotplug.d/iface \
          /usr/libexec /usr/share/luci/menu.d /usr/share/rpcd/acl.d \
-         /www/luci-static/resources/view/gdou-srun
+         /www/luci-static/resources/view/gdou-srun /www/luci-static/resources/gdou-srun
 
 if [ -f /etc/config/gdou-srun ]; then
 	echo "==> 检测到已有配置，保留（备份到 /tmp/gdou-srun.config.bak）"
@@ -108,7 +111,8 @@ chmod 755 /etc/init.d/gdou-srun /etc/hotplug.d/iface/90-gdou-srun
 chmod 755 /usr/libexec/gdou-srun /usr/libexec/gdou-srun-apply \
           /usr/libexec/gdou-srun-daemon /usr/libexec/gdou-srun-devices \
           /usr/libexec/gdou-srun-dual /usr/libexec/gdou-srun-mac \
-          /usr/libexec/gdou-srun-split /usr/libexec/gdou-srun-status
+          /usr/libexec/gdou-srun-split /usr/libexec/gdou-srun-status \
+          /usr/libexec/gdou-srun-diag /usr/libexec/gdou-srun-agent
 
 echo "==> 刷新 LuCI 缓存"
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null || true

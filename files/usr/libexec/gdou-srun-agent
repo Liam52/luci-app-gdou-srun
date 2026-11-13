@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""gdou-srun 常驻守护进程
+
+替代原来的 shell 守护进程。原实现每 3 秒 fork 一次 python 做探测：
+  单次 0.44s CPU × 28800 次/天 = 3.5 小时 CPU/天，约占单核 14.7%。
+
+本实现要点：
+  1. 单进程常驻，gdou-srun 只导入一次
+  2. 直接复用 gdou-srun 里的 portal_state 缓存（30s，限速时 600s）
+     → 热路径完全不发网络请求
+  3. 状态机 ONLINE / OFFLINE / AUTHING / COOLDOWN
+     → 只在状态翻转时写日志，不再刷屏
+  4. 登录失败指数退避（5→10→20→40→60s），不骚扰门户
+  5. 链路静默检测：收包长期不增长时不盲目重试
+  6. 定时重连 / 多链路同步 / 分流同步 / IPv6 模式 / 备份切换 统一在这里调度
+"""
+
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+LIBEXEC = "/usr/libexec"
+CONFIG = os.environ.get("GDOU_CONFIG", "/etc/config/gdou-srun")
+LOG = "/tmp/gdou-srun.log"
+PAUSE = "/tmp/gdou-srun.pause"
+BK_MARK = "/tmp/gdou-backup.on"
+SYNC_EVERY = 60          # 多链路/分流/IPv6 同步周期
+CFG_EVERY = 5            # 配置重读周期
+PROBE_ONLINE = 10        # 在线时的探测间隔
+PROBE_OFFLINE = 3        # 离线时的探测间隔
+BACKOFF = [5, 10, 20, 40, 60]
+
+# ---------------------------------------------------------------- 日志
+
+def log(ev, **kw):
+    """写一行日志：时间戳 + JSON。只保留最近 200 行。"""
+    kw["ev"] = ev
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                      json.dumps(kw, ensure_ascii=False, sort_keys=False))
+    try:
+        with open(LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        with open(LOG, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        if len(lines) > 200:
+            with open(LOG, "w", encoding="utf-8") as fh:
+                fh.writelines(lines[-200:])
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- 配置
+
+_CFG_CACHE = {"t": 0, "v": {}}
+
+
+def load_cfg(force=False):
+    """直接解析 /etc/config/gdou-srun，避免每次 fork uci。"""
+    now = time.time()
+    if not force and now - _CFG_CACHE["t"] < CFG_EVERY and _CFG_CACHE["v"]:
+        return _CFG_CACHE["v"]
+
+    cfg = {}
+    try:
+        with open(CONFIG, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"option\s+(\S+)\s+'?([^']*)'?$", line)
+                if m:
+                    cfg[m.group(1)] = m.group(2).strip()
+    except OSError:
+        pass
+
+    # 神秘字段兜底：解析失败就退回 uci（只会在异常时 fork 一次）
+    if not cfg.get("server"):
+        try:
+            out = subprocess.run(["uci", "-q", "show", "gdou-srun"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for m in re.finditer(r"\.(\w+)='([^']*)'", out):
+                cfg[m.group(1)] = m.group(2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _CFG_CACHE["t"] = now
+    _CFG_CACHE["v"] = cfg
+    return cfg
+
+
+def cfg_sig(cfg):
+    """配置指纹，用来发现变更。"""
+    keys = ("username", "password", "advanced", "dual_same_account", "split_mode",
+            "sub1_enabled", "sub2_enabled", "sub3_enabled", "sub1_dual", "sub2_dual",
+            "sub3_dual", "renew_enable", "renew_times", "ipv6_mode", "auto_apply")
+    return "|".join("%s=%s" % (k, cfg.get(k, "")) for k in keys)
+
+
+# ---------------------------------------------------------------- 外部脚本
+
+def run(script, args=None, timeout=90):
+    """调用子进程脚本。只在真正需要动作时用。"""
+    cmd = [os.path.join(LIBEXEC, script)] + list(args or [])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return False, "", "timeout"
+    except Exception as exc:  # noqa: BLE001
+        return False, "", str(exc)
+
+
+def uci_set(key, value):
+    """写 uci（只在确实需要改的时候调用，避免反复 fork）。"""
+    try:
+        subprocess.run(["uci", "-q", "set", "%s=%s" % (key, value)], timeout=10)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------- 导入认证核心
+
+def load_auth():
+    """把 gdou-srun 当模块导入（它有 __main__ 保护，import 不会执行命令）。
+
+    注意：gdou-srun 没有 .py 扩展名，importlib.util.spec_from_file_location()
+    对它返回 None，必须显式用 SourceFileLoader。
+    """
+    from importlib.machinery import SourceFileLoader
+    path = os.path.join(LIBEXEC, "gdou-srun")
+    loader = SourceFileLoader("gdou_srun_core", path)
+    spec = importlib.util.spec_from_loader("gdou_srun_core", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# ---------------------------------------------------------------- 链路活性
+
+def rx_packets(dev="eth0"):
+    try:
+        with open("/sys/class/net/%s/statistics/rx_packets" % dev) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return -1
+
+
+# ---------------------------------------------------------------- 主循环
+
+class Agent:
+    def __init__(self):
+        self.core = load_auth()
+        self.state = "unknown"      # online / offline / authing
+        self.prev_logged = None
+        self.backoff_idx = 0
+        self.next_login = 0
+        self.last_sync = 0
+        self.last_cfg = 0
+        self.last_sig = ""
+        self.last_renew_day = ""
+        self.last_renew_slot = ""
+        self.silent = 0             # 连续静默次数
+        self.last_rx = -1
+        self.last_rx_t = 0
+        self.renew_fail = 0
+
+    # ---------- 状态翻转 ----------
+    def set_state(self, new, why=""):
+        if new == self.state:
+            return
+        old = self.state
+        self.state = new
+        if old != "unknown":
+            log("state", **{"from": old, "to": new, "why": why})
+        else:
+            log("start", state=new)
+
+    # ---------- 调度 ----------
+    def tick(self):
+        now = time.time()
+        cfg = load_cfg()
+
+        if cfg.get("enabled", "1") != "1":
+            self.set_state("disabled", "配置里已停用")
+            time.sleep(5)
+            return
+
+        if os.path.exists(PAUSE):
+            self.set_state("paused", "主链路被手动下线")
+            time.sleep(5)
+            return
+
+        # 配置变更
+        if now - self.last_cfg >= CFG_EVERY:
+            self.last_cfg = now
+            sig = cfg_sig(cfg)
+            if sig != self.last_sig:
+                if self.last_sig:
+                    log("config_changed", auto_apply=cfg.get("auto_apply", "0"))
+                    if cfg.get("auto_apply") == "1":
+                        ok, out, _ = run("gdou-srun-apply", timeout=120)
+                        log("apply", ok=ok, out=out[-160:])
+                self.last_sig = sig
+
+        # 周期性同步（多链路 / 分流 / IPv6）：这些脚本本身是幂等的
+        if now - self.last_sync >= SYNC_EVERY:
+            self.last_sync = now
+            self.sync_all(cfg)
+
+        # 探测
+        try:
+            online = self.core.online(cfg)
+        except Exception as exc:  # noqa: BLE001
+            log("probe_error", msg=str(exc)[:120])
+            online = False
+
+        if online:
+            self.set_state("online", "门户/HTTP 探测通过")
+            self.backoff_idx = 0
+            self.silent = 0
+            self.after_online(cfg)
+            time.sleep(PROBE_ONLINE)
+            return
+
+        # ---- 离线 ----
+        self.set_state("offline", "探测未通过")
+        self.after_offline(cfg)
+        time.sleep(PROBE_OFFLINE)
+
+    # ---------- 在线时该做的事 ----------
+    def after_online(self, cfg):
+        # 备份模式：主链路恢复就切回来
+        if cfg.get("split_mode") == "backup" and os.path.exists(BK_MARK):
+            ok, _, _ = run("gdou-srun-split", ["backup", "off"], timeout=60)
+            if ok:
+                try:
+                    os.unlink(BK_MARK)
+                except OSError:
+                    pass
+                log("backup_off", why="主链路已恢复")
+
+        self.maybe_renew(cfg)
+
+    # ---------- 定时重连 ----------
+    def maybe_renew(self, cfg):
+        if cfg.get("renew_enable", "1") != "1":
+            return
+        times = (cfg.get("renew_times") or "").replace(",", " ").split()
+        if not times:
+            return
+        now = time.localtime()
+        hhmm = "%02d%02d" % (now.tm_hour, now.tm_min)
+        day = time.strftime("%Y%m%d")
+        slot = day + hhmm
+        if hhmm in times and slot != self.last_renew_slot:
+            self.last_renew_slot = slot
+            gap = cfg.get("renew_gap", "5")
+            log("renew_start", at=hhmm, gap=gap)
+            ok, out, err = run("gdou-srun", ["renew", str(gap)], timeout=150)
+            log("renew_done", ok=ok, detail=(out or err)[-200:])
+            if not ok:
+                self.renew_fail += 1
+                log("renew_failed", count=self.renew_fail)
+
+    # ---------- 离线时该做的事 ----------
+    def after_offline(self, cfg):
+        # 链路静默检测：收包长期不动说明是物理/对端问题，重试没意义
+        rx = rx_packets()
+        now = time.time()
+        if rx >= 0 and self.last_rx >= 0 and now - self.last_rx_t > 20:
+            if rx <= self.last_rx:
+                self.silent += 1
+                if self.silent == 3:
+                    log("link_silent", rx=rx, msg="收包长期不增长，暂停登录尝试")
+            else:
+                if self.silent >= 3:
+                    log("link_alive", rx=rx)
+                self.silent = 0
+            self.last_rx = rx
+            self.last_rx_t = now
+        elif self.last_rx < 0:
+            self.last_rx = rx
+            self.last_rx_t = now
+
+        if self.silent >= 3:
+            return          # 链路都不通，别撞门户
+
+        # 备份模式：主链路掉线就把局域网切到虚拟链路
+        if cfg.get("split_mode") == "backup" and os.path.exists("/sys/class/net/mcv0"):
+            if not os.path.exists(BK_MARK):
+                ok, out, _ = run("gdou-srun-dual", ["status"], timeout=40)
+                if '"authed": true' in out:
+                    ok2, _, _ = run("gdou-srun-split", ["backup", "on"], timeout=60)
+                    if ok2:
+                        log("backup_on", why="主链路掉线，切到虚拟链路")
+                    else:
+                        log("backup_on_failed")
+            return
+
+        # 退避后尝试登录
+        now = time.time()
+        if now < self.next_login:
+            return
+        self.set_state("authing", "准备登录")
+        ok, out, err = run("gdou-srun", ["login"], timeout=150)
+        detail = (out or err)[-220:]
+        if ok:
+            log("login_ok", detail=detail)
+            self.backoff_idx = 0
+            self.next_login = 0
+            self.set_state("online", "登录成功")
+        else:
+            wait = BACKOFF[min(self.backoff_idx, len(BACKOFF) - 1)]
+            self.backoff_idx += 1
+            self.next_login = time.time() + wait
+            log("login_failed", detail=detail, retry_in=wait)
+
+    # ---------- 周期同步 ----------
+    def sync_all(self, cfg):
+        # 多链路（脚本内部按配置算计划，幂等）
+        ok, out, err = run("gdou-srun-dual", ["sync"], timeout=180)
+        if not ok and (out or err):
+            log("dual_sync_failed", detail=(out or err)[-160:])
+
+        # 分流（幂等，规则没变就不动）
+        ok, out, err = run("gdou-srun-split", ["sync"], timeout=180)
+        if not ok and (out or err):
+            log("split_sync_failed", detail=(out or err)[-160:])
+
+        self.sync_ipv6(cfg)
+
+    # ---------- IPv6 三档 ----------
+    def sync_ipv6(self, cfg):
+        mode = cfg.get("ipv6_mode", "")
+        if not mode:
+            mode = "full" if cfg.get("ipv6") == "1" else "off"
+        if mode not in ("off", "campus", "full"):
+            mode = "off"
+
+        # wan6
+        dis = subprocess.run(["uci", "-q", "get", "network.wan6.disabled"],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+        if mode == "off" and dis != "1":
+            uci_set("network.wan6.disabled", "1")
+            subprocess.run(["uci", "-q", "commit", "network"], timeout=10)
+            subprocess.run(["/sbin/ifdown", "wan6"], timeout=20)
+            log("ipv6", wan6="off")
+        elif mode != "off" and dis == "1":
+            uci_set("network.wan6.disabled", "0")
+            subprocess.run(["uci", "-q", "commit", "network"], timeout=10)
+            subprocess.run(["/sbin/ifup", "wan6"], timeout=20)
+            log("ipv6", wan6="on", mode=mode)
+
+        # LAN 路由通告
+        ra = subprocess.run(["uci", "-q", "get", "dhcp.lan.ra"],
+                            capture_output=True, text=True, timeout=8).stdout.strip()
+        rad = subprocess.run(["uci", "-q", "get", "dhcp.lan.ra_default"],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+        changed = False
+        if mode == "off":
+            if ra != "disabled":
+                uci_set("dhcp.lan.ra", "disabled")
+                uci_set("dhcp.lan.dhcpv6", "disabled")
+                changed = True
+        elif mode == "campus":
+            if ra != "server":
+                uci_set("dhcp.lan.ra", "server")
+                changed = True
+            if rad != "0":
+                uci_set("dhcp.lan.ra_default", "0")
+                changed = True
+        else:
+            if ra != "server":
+                uci_set("dhcp.lan.ra", "server")
+                changed = True
+            if rad != "1":
+                uci_set("dhcp.lan.ra_default", "1")
+                changed = True
+        if changed:
+            subprocess.run(["uci", "-q", "commit", "dhcp"], timeout=10)
+            subprocess.run(["/etc/init.d/odhcpd", "restart"], timeout=30)
+            log("ipv6", lan="off" if mode == "off" else ("campus" if mode == "campus" else "full"))
+
+    # ---------- 启动 ----------
+    def run_forever(self):
+        log("boot", version="2.1.0-agent", pid=os.getpid())
+        while True:
+            try:
+                self.tick()
+            except KeyboardInterrupt:
+                log("exit", signal="SIGINT")
+                return 0
+            except Exception as exc:  # noqa: BLE001
+                log("loop_error", msg=("%s: %s" % (type(exc).__name__, exc))[:200])
+                time.sleep(5)
+
+
+if __name__ == "__main__":
+    sys.exit(Agent().run_forever())

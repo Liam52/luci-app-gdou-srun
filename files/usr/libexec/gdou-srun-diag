@@ -1,0 +1,191 @@
+#!/bin/sh
+# 生成诊断包：配置摘要 + 接口状态 + 路由 + 分流 + 日志。
+#
+# 用法（也是 LuCI 首页「下载诊断包」按钮调用的命令）：
+#   /usr/libexec/gdou-srun-diag
+#
+# 输出纯文本，直接重定向成 .txt 就能发给别人排查。
+# 断网时最有用的几个信号：
+#   1. rx_packets 是否增长（不增长 = 对端不发，端口可能被交换机封了）
+#   2. MAC 当前值与 mac_origin 是否一致（不一致 = 换过 MAC，可能触发端口绑定）
+#   3. 默认路由条数与指向（跑到已断开的热点接口上会导致 Network unreachable）
+
+KEY=gdou-srun.gdou_srun
+g() { uci -q get "$KEY.$1"; }
+
+hr() { echo "------------------------------------------------------------"; }
+
+# 有些板子（如 MT7981 + RTL822x 外部 2.5G PHY）的 eth0 是 fixed/2500base-x 链路，
+# MAC 侧永远 display carrier=1，跟网线插没插完全无关。这种情况下不能拿 carrier 判断。
+FIXED_LINK=0
+dmesg 2>/dev/null | grep -q "fixed/.*base-x" && FIXED_LINK=1
+
+echo "======= luci-app-gdou-srun 诊断包 ======="
+echo "生成时间 : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "主机名   : $(cat /proc/sys/kernel/hostname 2>/dev/null)"
+echo "运行时长 : $(awk '{printf "%d 小时 %d 分", $1/3600, ($1%3600)/60}' /proc/uptime 2>/dev/null)"
+echo "负载     : $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+echo
+
+echo "--- 配置 ---"
+for k in enabled advanced dual_same_account split_mode mac_refresh mac_mode \
+         interval login_cooldown server manual_acid last_good_acid acid \
+         renew_enable renew_times auto_apply ipv6; do
+	printf '%-18s %s\n' "$k" "$(g $k)"
+done
+printf '%-18s %s\n' "username" "$(g username)"
+i=1
+while [ "$i" -le 3 ]; do
+	printf '%-18s enabled=%s user=%s dual=%s\n' "sub$i" \
+		"$(g sub${i}_enabled)" "$(g sub${i}_username)" "$(g sub${i}_dual)"
+	i=$((i + 1))
+done
+echo
+
+echo "--- 接口 ---"
+for dev in eth0 br-lan; do
+	[ -e "/sys/class/net/$dev" ] || continue
+	echo "$dev:"
+	if [ "$dev" = "eth0" ] && [ "$FIXED_LINK" = "1" ]; then
+		echo "  carrier=$(cat /sys/class/net/$dev/carrier 2>/dev/null) （固定链路，carrier 恒为 1，不代表网线状态）"
+		echo "  operstate=$(cat /sys/class/net/$dev/operstate 2>/dev/null) speed=$(cat /sys/class/net/$dev/speed 2>/dev/null)Mb mtu=$(cat /sys/class/net/$dev/mtu 2>/dev/null)"
+	else
+		echo "  carrier=$(cat /sys/class/net/$dev/carrier 2>/dev/null) operstate=$(cat /sys/class/net/$dev/operstate 2>/dev/null) speed=$(cat /sys/class/net/$dev/speed 2>/dev/null)Mb mtu=$(cat /sys/class/net/$dev/mtu 2>/dev/null)"
+	fi
+	echo "  MAC=$(cat /sys/class/net/$dev/address 2>/dev/null)  IP=$(ip -4 addr show "$dev" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | tr '\n' ' ')"
+	echo "  rx_packets=$(cat /sys/class/net/$dev/statistics/rx_packets 2>/dev/null) tx_packets=$(cat /sys/class/net/$dev/statistics/tx_packets 2>/dev/null)"
+	echo "  rx_errors=$(cat /sys/class/net/$dev/statistics/rx_errors 2>/dev/null) rx_dropped=$(cat /sys/class/net/$dev/statistics/rx_dropped 2>/dev/null)"
+done
+
+# MAC 一致性：换过 MAC 且学校按 MAC 绑定端口时，这里不一致就是断网的根因
+cur_mac=$(cat /sys/class/net/eth0/address 2>/dev/null)
+orig_mac=$(g mac_origin)
+
+# 有些固件在 /etc/config/network 的 config device 段固定了网口 MAC，
+# 优先于 interface 上的 macaddr。这种情况“当前 != mac_origin”是正常的，
+# 不应该报警，否则会误导成端口被封。
+dev_mac=""
+di=0
+while uci -q get "network.@device[$di]" >/dev/null 2>&1; do
+	if [ "$(uci -q get "network.@device[$di].name")" = "eth0" ]; then
+		dev_mac=$(uci -q get "network.@device[$di].macaddr")
+		break
+	fi
+	di=$((di + 1))
+done
+
+echo
+echo "MAC 当前 : $cur_mac"
+echo "MAC 原始 : $orig_mac"
+[ -n "$dev_mac" ] && echo "device 段 : $dev_mac （优先级最高）"
+if [ -n "$orig_mac" ] && [ "$cur_mac" = "$orig_mac" ]; then
+	echo "MAC 结论 : 一致"
+elif [ -n "$dev_mac" ] && [ "$cur_mac" = "$dev_mac" ]; then
+	echo "MAC 结论 : 一致（由 config device 段固定）"
+	echo "           注意：mac_origin 记录的 $orig_mac 已过期，"
+	echo "           执行 restore 会把 MAC 切过去，可能触发端口绑定策略。"
+else
+	echo "MAC 结论 : ** 不一致，且不是 device 段固定的值 **"
+	echo "           若学校按 MAC 绑定端口，端口可能已被静默封禁"
+	echo "           恢复命令： /usr/libexec/gdou-srun-mac restore"
+fi
+
+# 收包活性：5 秒内 rx 是否增长
+r1=$(cat /sys/class/net/eth0/statistics/rx_packets 2>/dev/null || echo 0)
+sleep 5
+r2=$(cat /sys/class/net/eth0/statistics/rx_packets 2>/dev/null || echo 0)
+echo "收包活性 : eth0 5 秒内 +$((r2 - r1)) 包"
+if [ $((r2 - r1)) -gt 0 ]; then
+	echo "           链路有数据进来（正常）"
+elif [ "$FIXED_LINK" = "1" ]; then
+	echo "           ** 5 秒零收包：网线没插好、墙口无信号，或交换机不转发 **"
+	echo "           （本机 eth0 是固定 2500base-x 链路，carrier 恒为 1，不能作为判断依据）"
+else
+	echo "           ** 5 秒零收包：对端不发数据，端口可能被交换机禁用 **"
+fi
+echo
+
+echo "--- 路由 ---"
+echo "默认路由（$(ip route show default 2>/dev/null | wc -l) 条）："
+ip route show default 2>/dev/null | sed 's/^/  /'
+echo "部分主表："
+ip route show 2>/dev/null | head -12 | sed 's/^/  /'
+echo "ip rule："
+ip rule show 2>/dev/null | sed 's/^/  /'
+echo
+
+echo "--- IPv6 ---"
+_iv6=$(g ipv6_mode)
+if [ -z "$_iv6" ]; then
+	[ "$(g ipv6)" = "1" ] && _iv6=full || _iv6=off
+fi
+case "$_iv6" in
+off)    _ivd="关闭（不用 IPv6）" ;;
+campus) _ivd="仅内网（发地址，不发默认路由）" ;;
+full)   _ivd="完整（正常下发默认路由）" ;;
+*)      _ivd="未知：$_iv6" ;;
+esac
+echo "模式     : $_iv6 —— $_ivd"
+if uci -q get network.wan6 >/dev/null 2>&1; then
+	echo "wan6     : disabled=$(uci -q get network.wan6.disabled)"
+fi
+if uci -q get dhcp.lan >/dev/null 2>&1; then
+	echo "LAN 通告 : ra=$(uci -q get dhcp.lan.ra) ra_default=$(uci -q get dhcp.lan.ra_default) dhcpv6=$(uci -q get dhcp.lan.dhcpv6)"
+fi
+echo "地址     : eth0 全局=$(ip -6 addr show eth0 2>/dev/null | grep -c "scope global")  br-lan 全局=$(ip -6 addr show br-lan 2>/dev/null | grep -c "scope global")"
+echo "v6 默认路由: $(ip -6 route show default 2>/dev/null | head -1 || echo 无)"
+echo
+
+echo "--- 分流 ---"
+if iptables -t mangle -S GDSPLIT >/dev/null 2>&1; then
+	iptables -t mangle -S GDSPLIT 2>/dev/null | grep -v '^-N' | sed 's/^/  /'
+else
+	echo "  （没有分流规则 / 未启用）"
+fi
+echo
+
+echo "--- 守护进程 ---"
+gp=$(pgrep -f "^python3 /usr/libexec/gdou-srun-agent" 2>/dev/null | head -1)
+gd=$(pgrep -f "^/bin/sh /usr/libexec/gdou-srun-daemon" 2>/dev/null | head -1)
+if [ -n "$gp" ]; then
+	echo "类型     : agent（常驻 Python）pid=$gp"
+	echo "内存     : $(awk '/VmRSS/{printf "%.1f MB", $2/1024}' /proc/$gp/status 2>/dev/null)"
+	t1=$(awk '{print $14+$15+$16+$17}' /proc/$gp/stat 2>/dev/null)
+	sleep 3
+	t2=$(awk '{print $14+$15+$16+$17}' /proc/$gp/stat 2>/dev/null)
+	echo "CPU      : $(awk -v a=$((t2-t1)) 'BEGIN{printf "%.2f%% 单核", a/3/100*100}')"
+elif [ -n "$gd" ]; then
+	echo "类型     : legacy shell daemon pid=$gd（每 3 秒 fork python，CPU 约 18%）"
+else
+	echo "类型     : ** 没有守护进程在跑 **"
+fi
+echo "开机自启 : $(/etc/init.d/gdou-srun enabled && echo 是 || echo 否)"
+echo "暂停标记 : $([ -f /tmp/gdou-srun.pause ] && echo 有（主链路被下线） || echo 无)"
+echo
+
+echo "--- 认证状态 ---"
+printf 'check    : '
+if /usr/libexec/gdou-srun check >/dev/null 2>&1; then echo "在线"; else echo "离线"; fi
+srv=$(g server)
+host=$(echo "${srv:-http://10.129.1.1}" | sed 's|^[a-z]*://||; s|/.*||; s|:.*||')
+printf '门户 %-14s : ' "$host"
+wget -qO- -T 6 "http://$host/cgi-bin/rad_user_info?callback=sdu" 2>/dev/null | head -c 240
+echo
+echo
+
+hr
+echo "插件日志 /tmp/gdou-srun.log（最近 200 行）"
+hr
+tail -n 200 /tmp/gdou-srun.log 2>/dev/null || echo "（无日志）"
+echo
+hr
+echo "多链路日志 /tmp/gdou-dual.log（最近 100 行）"
+hr
+tail -n 100 /tmp/gdou-dual.log 2>/dev/null || echo "（无日志）"
+echo
+hr
+echo "系统日志中网络相关（最近 40 行）"
+hr
+logread 2>/dev/null | grep -iE "gdou|eth0|wan|udhcpc|dhcp" | tail -n 40
+echo
+echo "======= 诊断包结束 ======="

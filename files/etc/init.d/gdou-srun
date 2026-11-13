@@ -6,10 +6,12 @@ USE_PROCD=1
 
 start_service() {
 	procd_open_instance
-	procd_set_param command /usr/libexec/gdou-srun-daemon
-	procd_set_param respawn 3600 5 0
-	procd_set_param stdout 1
-	procd_set_param stderr 1
+	# 常驻 Python 守护：进程内循环探测，不再每 3 秒 fork 一次解释器
+	# （旧实现实测 0.44s CPU/次 × 28800 次/天 ≈ 3.5 小时 CPU/天）
+	procd_set_param command /usr/libexec/gdou-srun-agent
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 0
+	procd_set_param stderr 0
 	procd_close_instance
 }
 

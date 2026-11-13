@@ -34,6 +34,17 @@ function heading(text) {
 		'border-bottom:1px solid rgba(128,128,128,.25)">' + text + '</div>';
 }
 
+/* 注入公共样式（只注入一次） */
+function ensureUiCss() {
+	var id = 'gdou-ui-css';
+	if (document.getElementById(id)) return;
+	var l = document.createElement('link');
+	l.id = id;
+	l.rel = 'stylesheet';
+	l.href = '/luci-static/resources/gdou-srun/ui.css';
+	document.head.appendChild(l);
+}
+
 return view.extend({
 	render: function () {
 		var m = new form.Map('gdou-srun', '基础设置',
@@ -59,14 +70,14 @@ return view.extend({
 			dummySeq++;
 			var o = s.option(form.DummyValue, '_head' + dummySeq, null);
 			o.rawhtml = true;
-			o.default = heading(text);
+			o.default = '<div class="gd-sect-title">' + text + '</div>';
 			return o;
 		}
 
 		var o;
 
-		/* ---------------- 账号 ---------------- */
-		title('账号');
+		/* ---------------- 常用（永远可见）---------------- */
+		title('常用');
 
 		o = s.option(form.Flag, 'enabled', '启用自动认证');
 		o.default = '1';
@@ -82,6 +93,21 @@ return view.extend({
 		o.password = true;
 		o.rmempty = false;
 
+		o = s.option(form.Flag, 'advanced', '开启进阶选项',
+			'开启后才会显示下面的定时重连、检测、IPv6、MAC 等设置，' +
+			'并解锁「多链路」标签页的从账号功能。日常只填账号密码可以一直关着。');
+		o.default = '0';
+		o.rmempty = false;
+
+		o = s.option(form.Flag, 'auto_apply', '保存后自动重建连接',
+			'默认关闭。开启后改动账号或多链路设置并保存，约 5~10 秒内自动下线重连。' +
+			'关闭时只记录变更，需要手动点「立即重连」。');
+		o.default = '0';
+		o.rmempty = false;
+
+		/* 从这里开始的选项都属于「进阶」，统一挂到上面的开关下 */
+		var advStart = s.children.length;
+
 		/* ---------------- 双链路聚合 ---------------- */
 		title('双链路聚合');
 		help('在主链路之外再开一条虚拟链路，用同一份或另一份凭据再认证一次，' +
@@ -93,13 +119,7 @@ return view.extend({
 		o.default = '0';
 		o.rmempty = false;
 
-		o = s.option(form.ListValue, 'split_mode', '聚合模式',
-			'决定两条链路怎么分担流量。只有存在第二条链路时才生效。');
-		o.value('backup', '网络备份');
-		o.value('conn', '负载均衡');
-		o.value('dev', '链路聚合');
-		o.default = 'backup';
-		o.rmempty = false;
+		help('分流模式（备份 / 按连接 / 按设备）挪到了 <b>多链路</b> 标签页，和链路计划放在一起。');
 
 		help('<div style="font-size:12px;line-height:1.75;opacity:.82;margin-top:2px">' +
 			'<b>各模式效果</b><br>' +
@@ -171,6 +191,18 @@ return view.extend({
 		o.datatype = 'range(5,600)';
 
 		/* ---------------- 接入设备 ---------------- */
+		title('IPv6');
+		o = s.option(form.ListValue, 'ipv6_mode', 'IPv6 模式',
+			'关闭 = 完全不用 IPv6。' +
+			'仅内网 = 给内网设备发 IPv6 地址，但**不下发默认路由**，' +
+			'IPv6 只用于校内资源，访问外网仍然走 IPv4。' +
+			'完整 = 正常下发 IPv6 默认路由，需要外网也有 IPv6，否则设备会优先走 IPv6 而卡住。');
+		o.value('off', '关闭');
+		o.value('campus', '仅内网（不发布默认路由）');
+		o.value('full', '完整');
+		o.default = 'off';
+		o.rmempty = false;
+
 		title('接入设备 ac_id');
 
 		o = s.option(form.Value, 'manual_acid', '手动指定',
@@ -204,15 +236,8 @@ return view.extend({
 		o.default = 'HarmonyOS';
 		o.placeholder = 'HarmonyOS';
 
-		/* ---------------- 手动操作 ---------------- */
-		title('手动操作');
-
-		o = s.option(form.Flag, 'auto_apply', '保存后自动重建连接',
-			'默认关闭。开启后：改动主账号、从账号或多链路设置并保存，' +
-			'约 5~10 秒内自动下线全部连接、再按新配置重连（期间断网十几秒）。' +
-			'关闭时只记录变更，需要你点下面的「立即重连」才会重建。');
-		o.default = '0';
-		o.rmempty = false;
+		/* ---------------- 更多操作（进阶）---------------- */
+		title('更多操作');
 
 		dummySeq++;
 		o = s.option(form.DummyValue, '_actions' + dummySeq, null);
@@ -230,25 +255,28 @@ return view.extend({
 
 		help('到点重连与刷新 MAC 都会短暂断网；改完记得点页面底部「保存并应用」。');
 
-		/* ---------------- 高阶设置（放在最底部）---------------- */
-		title('高阶设置');
-		help('<div style="padding:10px 12px;border-radius:8px;background:rgba(198,40,40,.10);' +
-			'border:1px solid rgba(198,40,40,.38);color:#b71c1c;font-size:12.5px;line-height:1.7">' +
-			'<b>⚠ 实验性功能，会改变网络结构。</b><br>' +
-			'· 每条链路占一个<b>设备额度</b>，套餐设备数超限会把你正在用的设备顶下线；<br>' +
-			'· 同一网口出现多个 MAC / IP，可能触发学校的<b>端口安全或共享检测</b>，最坏情况是网口被临时禁用；<br>' +
-			'· 填写他人账号可能违反校规，并连累对方账号被处理；<br>' +
-			'· 出错时可能导致<b>整机断网</b>，需要断电重启才能恢复。</div>');
-
-		o = s.option(form.Flag, 'advanced', '启用高阶设置',
-			'勾选后才显示「双链路聚合」，并解锁高阶设置标签页里的从账号配置。');
-		o.default = '0';
-		o.rmempty = false;
-
-		help('勾选并保存后，到 <b>高阶设置</b> 标签页配置最多 4 个从账号（每个都可单独开双链路），' +
-			'那里还有链路计划预览与「建立 / 拆除」按钮。');
+		/* 把 advStart 之后创建的所有选项统一折叠到「开启进阶选项」下 */
+		for (var ai = advStart; ai < s.children.length; ai++) {
+			var child = s.children[ai];
+			if (child && typeof child.depends === 'function')
+				child.depends('advanced', '1');
+		}
 
 		return m.render().then(function (node) {
+			ensureUiCss();
+			/* 页面级作用域：让原生表单控件也套用统一风格 */
+			var gdRoot = (node.matches && node.matches('.cbi-map')) ? node :
+				(node.querySelector('.cbi-map') || node.querySelector('.cbi-section') || node);
+			if (gdRoot && gdRoot.classList) gdRoot.classList.add('gd-page');
+
+			/* Argon 给 .cbi-value-title 固定了 23rem 宽，标签为空的区块会被挤窄。
+			   这里把「内容是我们自定义区块」的行标成 gd-full，由 CSS 压掉标签列。 */
+			var gdRows = node.querySelectorAll('.cbi-value');
+			Array.prototype.forEach.call(gdRows, function (row) {
+				if (row.querySelector('.gd-grid, .gd-card, .gd-tbl, .gd-sect, .gd-alert, details.gd-fold'))
+					row.classList.add('gd-full');
+			});
+
 			/* ---------- 双链路：勾选时弹风险确认 ---------- */
 			var dualBox = node.querySelector('[name="cbid.gdou-srun.gdou_srun.dual_same_account"]') ||
 				node.querySelector('#cbid\.gdou-srun\.gdou_srun\.dual_same_account');

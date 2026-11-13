@@ -8,6 +8,9 @@
     ],
     "/tmp/gdou-srun.log": [
      "read"
+    ],
+    "/tmp/gdou-dual.log": [
+     "read"
     ]
    },
    "uci": [
@@ -36,6 +39,9 @@
      "exec"
     ],
     "/usr/libexec/gdou-srun-split": [
+     "exec"
+    ],
+    "/usr/libexec/gdou-srun-diag": [
      "exec"
     ]
    },

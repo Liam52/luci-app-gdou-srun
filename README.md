@@ -6,6 +6,9 @@
 
 只做一件事：**让路由器开机自动认证，掉线自动重连**。没有测速、没有广告、没有多余功能。
 
+[![GitHub](https://img.shields.io/badge/repo-Liam52%2Fluci--app--gdou--srun-181717?logo=github)](https://github.com/Liam52/luci-app-gdou-srun)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+
 > 🤖 **本项目由 AI 辅助开发**（代码 / 文档 / 排错），使用前请阅读文末的 [AI 辅助开发声明](#ai-辅助开发声明)。
 
 ---
@@ -32,7 +35,7 @@
 
 | 标签 | 内容 |
 |---|---|
-| **首页** | 顶部状态栏（在线/离线、WAN 接口、IP、MAC）+ 多链路表格（每行可重连/换MAC/下线）+ 校园网在线设备 + 快捷操作 |
+| **首页** | 顶部状态栏（在线/离线、WAN 接口、IP、MAC）+ 多链路表格（每行可重连/换MAC/下线）+ 校园网在线设备 + 快捷操作 + **下载诊断包** |
 | **基础设置** | 账号密码、认证参数、定时重连、检测间隔、ac_id、MAC 轮换、高阶总开关 |
 | **高阶设置** | 从账号配置（学号/密码/双链路）、从账号启用（开关）、链路计划预览、批量操作、分流模式 |
 
@@ -66,7 +69,7 @@ scp dist/gdou-router-install.sh root@192.168.1.1:/tmp/
 ssh root@192.168.1.1 "sh /tmp/gdou-router-install.sh"
 ```
 
-也可以直接从 [Releases](../../releases) 下载现成的 `gdou-router-install.sh`。
+也可以直接从 [Releases](https://github.com/Liam52/luci-app-gdou-srun/releases) 下载现成的 `gdou-router-install.sh`。
 
 脚本用 heredoc 写文件（不依赖 base64 / tar），会自己铺文件、注册服务、
 **保留旧配置里的账号密码**，跑完就能用。
@@ -74,7 +77,7 @@ ssh root@192.168.1.1 "sh /tmp/gdou-router-install.sh"
 ### 方式二：从源码装
 
 ```sh
-git clone https://github.com/<你的用户名>/luci-app-gdou-srun.git
+git clone https://github.com/Liam52/luci-app-gdou-srun.git
 scp -r luci-app-gdou-srun root@192.168.1.1:/tmp/
 ssh root@192.168.1.1
 cd /tmp/luci-app-gdou-srun && sh install.sh
@@ -107,6 +110,7 @@ make package/luci-app-gdou-srun/compile V=s
 | 兜底 ac_id | 25 | 全都失败时最后试这个 |
 | 认证服务器 | `http://10.129.1.1` | 门户地址 |
 | 自动同意上网协议 | 开 | 门户要求勾选协议时自动完成 |
+| IPv6 模式 | `off` | `off` 完全关闭 / `campus` 仅内网（发地址不发默认路由）/ `full` 完整。详见「IPv6」小节 |
 | 设备名 (name) | `Huawei` | 登录时上报给门户的设备名，留空用默认值 |
 | 系统名 (os) | `HarmonyOS` | 登录时上报的系统名，留空用默认值 |
 
@@ -302,6 +306,29 @@ procd 启动
 | `ip_already_online`（该 IP 已在线） | 视为成功 |
 | 其它 | 按检测间隔重试 |
 
+## IPv6（三档，默认关闭）
+
+页面「基础设置 → IPv6」里三选一：
+
+| 模式 | `wan6` | LAN 路由通告 | 适用场景 |
+|---|---|---|---|
+| `off`（默认） | 关闭 | 关闭 | 外网没有 IPv6 —— 最稳，日志干净 |
+| `campus` | 开启 | 发地址、**不发默认路由** | 校内网有 IPv6、外网没有：设备能用 IPv6 访问校内资源，访问外网仍走 IPv4 |
+| `full` | 开启 | 正常下发默认路由 | 校内校外都有 IPv6 |
+
+`campus` 的原理是设 `dhcp.lan.ra_default='0'`——LAN 设备会拿到 IPv6 地址（SLAAC），
+但收不到 IPv6 默认网关，所以不会把外网流量往 IPv6 上送。
+
+```sh
+# 等价命令
+uci set gdou-srun.gdou_srun.ipv6_mode='campus'
+uci commit gdou-srun && /etc/init.d/gdou-srun restart
+```
+
+> **注意**：`campus` 模式要真正有用，路由器得能从 WAN 拿到 IPv6 前缀（DHCPv6-PD 或 RA）。
+> 如果 WAN 侧没有 IPv6，LAN 只能拿到路由器的 ULA 地址（`fdfd:...`），校内资源仍访问不到。
+> 用 `gdou-srun-diag` 看「IPv6」那一段就能确认。
+
 ## MAC 轮换（默认关闭）
 
 有些校园网会按 MAC 做设备数限制或风控。开启后，插件在**每次登录前**把 WAN 口 MAC 换成地址池里的另一个，池子固定 5 个地址，避免每次都变导致 DHCP 反复重新分配。
@@ -332,6 +359,15 @@ procd 启动
 即便如此，**仍建议保持 `mac_refresh=0`**。端口绑定是硬限制，自动保护只能保证"不至于一直断网"，
 不能保证换了 MAC 就一定能上网。
 
+> **⚠️ 改了 MAC 但重启后失效？** 检查 `/etc/config/network` 里有没有
+> `config device` + `option name 'eth0'` + `option macaddr` 段——**它的优先级高于 interface 上的 `macaddr`**。
+> v2.0.0 起插件会同时写这两处，`gdou-srun-mac show` 也会把 device 段的值显示出来。
+
+> **⚠️ `carrier` 不能用来判断网线是否插好**：部分板子（如 MT7981 + 外部 RTL822x 2.5G PHY）
+> 的 `eth0` 是 `fixed/2500base-x` 固定链路，**MAC 侧 carrier 永远显示 1**，跟网线插没插无关。
+> 判断链路是否真的通，要看 `rx_packets` 在几秒内是否增长，或者直接看 DHCP 有没有拿到地址。
+> `gdou-srun-diag` 会自动识别这种硬件并在输出里标注。
+
 手动排查/恢复：
 
 ```sh
@@ -348,6 +384,31 @@ cat /sys/class/net/eth0/statistics/rx_packets; sleep 4; cat /sys/class/net/eth0/
 
 ## 日志与排错
 
+### 断网了先点「下载诊断包」
+
+首页最下面的**「下载诊断包」**按钮，会生成一个 `.txt` 直接下载到电脑，内容是：
+
+| 段落 | 用来判断 |
+|---|---|
+| 配置摘要 | 总开关、分流模式、MAC 轮换是否开启 |
+| 接口状态 | `carrier` / `operstate` / `speed` / MAC / IP / 收发计数 |
+| **MAC 一致性** | 当前 MAC 与 `mac_origin` 是否相同（不一致多半是被端口绑定封了） |
+| **收包活性** | `eth0` 5 秒内收包增量，**为 0 说明对端不发数据** |
+| 路由 | 默认路由条数与指向（跑到已断开的接口上会导致 `Network unreachable`） |
+| 分流 | `GDSPLIT` 规则和命中计数 |
+| 认证状态 | `check` 结果 + 门户返回的原始 JSON |
+| 日志 | 插件日志 200 行 + 多链路日志 100 行 + 系统网络日志 40 行 |
+
+一份文件就能看出问题在「认证逻辑」还是在「链路层」，不用再猜。
+
+命令行等价：
+
+```sh
+/usr/libexec/gdou-srun-diag > /tmp/diag.txt
+```
+
+### 看日志
+
 ```sh
 tail -f /tmp/gdou-srun.log
 logread | grep gdou-srun
@@ -361,7 +422,7 @@ logread | grep gdou-srun
 | `E2901 ldap_bind error` | 密码错了（不是账号错） |
 | 装了插件但 LuCI 无菜单 | `rm -rf /tmp/luci-indexcache*; /etc/init.d/rpcd restart` |
 | `uci: Invalid argument` | 用了 `gdou-srun.gdou_srun` 之外的老段名，见上方“命令行”注 |
-| **能连不能上，一直 `Host is unreachable`** | 先查 MAC 是否被换过（见上方「端口安全」）。`carrier` 正常但 `rx_packets` 不增长 = 端口被交换机封了，`gdou-srun-mac restore` 恢复 |
+| **能连不能上，一直 `Host is unreachable`** | 先查 MAC 是否被换过（见上方「端口安全」）。`rx_packets` 几分钟不增长 = 对端没在发数据（网线/墙口/端口被封），可用 `gdou-srun-diag` 一键取证 |
 | 校园网和热点同时在用，认证却失败 | 默认路由被热点抢走了。`ip route show default` 应该是 `via <校园网关> dev eth0`；有两条时给热点接口加 `metric` 让校园网优先 |
 
 ## 已知限制
@@ -371,6 +432,14 @@ logread | grep gdou-srun
 - 学校若限制在线设备数，路由器长期在线会占掉一个名额
 - 只适配广东海洋大学当前的门户；同厂商（深澜）的其他学校可改 `server` 与 `ac_id` 试，但不保证
 - **部分学校按 MAC 绑定端口**：换 MAC 会导致端口静默封禁（能发不能收）。插件已内置自动回退，但建议不要开 MAC 轮换
+- **IPv6 默认关闭**（`ipv6_mode=off`），原因：外网没有 IPv6，给内网下发 IPv6 默认路由会让设备
+  优先走 IPv6 访问外网，结果连不上或变慢；而且实测接入的 WAN 口只拿到 `fe80::` 链路本地地址，
+  开着只会让 `odhcp6c` 反复报 `Failed to send RS`。校内确实存在 IPv6（部分楼栋/无线），
+  想用请切到 `campus` 模式（见下方「IPv6」小节）
+- **门户返回 `speed_limit_error` 属正常现象**：广海的移动限速套餐本身就在限速计费组里，
+  门户时不时回这个标记，并且**不返回会话详情**（`billing_name` / `all_bytes` / 设备列表全部缺失）。
+  只要 `online_ip` 还是你的地址，会话就还在，不代表掉线或账号异常。
+  本校实测单连接速度本来就在 50~150 Mbps 区间
 - **多链路不等于多带宽**：学校按账号限速，同账号第二条链路通常只能分到零头；跨账号才是真正独立的额度
 - **下载速度还受对端 CDN 限制**：实测腾讯/Steam 的 CDN 单连接只给 10~80 Mbps，开多少条链路都改变不了单连接速度
 - 硬件加速（MTK HNAT）开启时，约 13% 的新连接会绕过 netfilter 打标，这些连接会固定走主链路；不影响功能，只影响分流比例
@@ -380,40 +449,49 @@ logread | grep gdou-srun
 
 ```
 luci-app-gdou-srun/
-├── Makefile                              # OpenWrt 包定义
-├── install.sh                            # 单文件安装脚本（免编译）
+├── Makefile                              # OpenWrt 包定义（PKG_VERSION 2.2.0）
+├── install.sh                            # 免编译安装脚本
+├── tools/
+│   └── make-single-file.sh               # 生成自包含单文件安装器
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE                               # GPL-3.0
+├── .gitignore / .gitattributes
 └── files/
     ├── etc/
     │   ├── config/gdou-srun              # UCI 默认配置
     │   ├── hotplug.d/iface/90-gdou-srun  # 接口 up/down 触发
-    │   └── init.d/gdou-srun              # procd 服务
+    │   └── init.d/gdou-srun              # procd 服务（启动 agent）
     ├── usr/libexec/
-    │   ├── gdou-srun                     # 认证核心（challenge / login / logout / check）
-    │   ├── gdou-srun-daemon              # 守护循环
-    │   ├── gdou-srun-apply               # 配置变更后重载
-    │   ├── gdou-srun-status              # 状态查询（首页用）
+    │   ├── gdou-srun                     # 认证核心：challenge / login / logout / check
+    │   ├── gdou-srun-agent               # 常驻 Python 守护（推荐，CPU 约 1.9%）
+    │   ├── gdou-srun-daemon              # 旧 shell 守护（回退用，不随服务启动）
+    │   ├── gdou-srun-apply               # 配置变更后整体重建
+    │   ├── gdou-srun-status              # 状态查询（首页数据源）
     │   ├── gdou-srun-devices             # 门户在线设备解析
-    │   ├── gdou-srun-mac                 # WAN MAC 轮换
+    │   ├── gdou-srun-diag                # 诊断包生成（配置/接口/MAC/路由/日志）
+    │   ├── gdou-srun-mac                 # WAN MAC 轮换（含端口安全回退）
     │   ├── gdou-srun-dual                # 多链路：建立/拆除/重连/换MAC/下线
-    │   └── gdou-srun-split               # 分流规则（conn / dev / off）
+    │   └── gdou-srun-split               # 分流规则（backup / conn / dev）
     ├── usr/share/luci/menu.d/            # 菜单
     ├── usr/share/rpcd/acl.d/             # ACL 权限
-    └── www/luci-static/resources/view/gdou-srun/
-        ├── home.js                       # 首页
-        ├── settings.js                   # 基础设置
-        └── advanced.js                   # 高阶设置
+    └── www/luci-static/resources/
+        ├── gdou-srun/
+        │   └── ui.css                    # 三页共用的样式（约 16 KB）
+        └── view/gdou-srun/
+            ├── home.js                   # 首页：状态 / 账号 / 操作 / 链路 / 设备
+            ├── settings.js               # 设置：常用 + 进阶折叠
+            └── advanced.js               # 多链路：从账号 / 计划 / 分流 / 批量操作
 ```
 
-Python 脚本（`gdou-srun`、`gdou-srun-dual`、`gdou-srun-split`、`gdou-srun-devices`）
-依赖 `python3-light`；其余是 POSIX shell。
+**运行时依赖**：`python3-light`、`python3-urllib`、`python3-hashlib`、`python3-email`。
+`gdou-srun`、`gdou-srun-agent`、`gdou-srun-dual`、`gdou-srun-split`、`gdou-srun-devices` 是 Python；
+其余是 POSIX shell。
 
 ## 参与开发
 
 ```sh
-git clone https://github.com/<你的用户名>/luci-app-gdou-srun.git
+git clone https://github.com/Liam52/luci-app-gdou-srun.git
 cd luci-app-gdou-srun
 
 # 改完后推到你自己的路由器测试（免编译）
@@ -487,3 +565,7 @@ rm -rf /tmp/luci-indexcache* && /etc/init.d/rpcd restart
 
 - 深澜 srun 认证流程参考了社区公开的逆向资料
 - LuCI / OpenWrt 团队
+
+---
+
+**当前版本**：2.2.0 · 见 [CHANGELOG.md](CHANGELOG.md) 了解每个版本的改动。
