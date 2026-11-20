@@ -47,6 +47,7 @@ if [ -f "$ROOT/etc/config/gdou-srun" ]; then
 		ipv6_mode=off portal_os=HarmonyOS portal_name=Huawei \
 		advanced=0 auto_apply=0 dual_same_account=0 split_mode=backup \
 		renew_enable=1 renew_gap=5 \
+		reboot_enable=0 reboot_times=0400 reboot_on_fail=0 reboot_fail_threshold=20 \
 		mac_refresh=0 mac_mode=pool mac_gap=300 mac_origin= \
 		sub1_enabled=0 sub1_dual=0 sub2_enabled=0 sub2_dual=0 \
 		sub3_enabled=0 sub3_dual=0 \
@@ -72,13 +73,13 @@ fi
 say "==> 复制程序"
 for f in gdou-srun gdou-srun-apply gdou-srun-daemon gdou-srun-devices \
          gdou-srun-dual gdou-srun-mac gdou-srun-split gdou-srun-status \
-         gdou-srun-diag gdou-srun-agent; do
+         gdou-srun-diag gdou-srun-agent gdou-srun-reboot; do
 	cp -f "$SRC/files/usr/libexec/$f" "$ROOT/usr/libexec/$f"
 	chmod 755 "$ROOT/usr/libexec/$f"
 done
 
 say "==> 复制 LuCI 视图"
-cp -f "$SRC/files/www/luci-static/resources/view/gdou-srun/home.js"     "$ROOT/www/luci-static/resources/view/gdou-srun/home.js"
+cp -f "$SRC/files/www/luci-static/resources/view/gdou-srun/dashboard.js" "$ROOT/www/luci-static/resources/view/gdou-srun/dashboard.js"
 cp -f "$SRC/files/www/luci-static/resources/view/gdou-srun/settings.js" "$ROOT/www/luci-static/resources/view/gdou-srun/settings.js"
 cp -f "$SRC/files/www/luci-static/resources/view/gdou-srun/advanced.js" "$ROOT/www/luci-static/resources/view/gdou-srun/advanced.js"
 

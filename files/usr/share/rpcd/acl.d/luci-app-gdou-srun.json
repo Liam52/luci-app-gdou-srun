@@ -46,6 +46,12 @@
     ],
     "/usr/libexec/gdou-srun-diag": [
      "exec"
+    ],
+    "/sbin/reboot": [
+     "exec"
+    ],
+    "/usr/libexec/gdou-srun-reboot": [
+     "exec"
     ]
    },
    "uci": [

@@ -1,0 +1,42 @@
+#!/bin/sh
+# 重启路由器，并在重启前把诊断日志保存到持久存储。
+#
+# 为什么要这个脚本：
+#   /tmp 是内存盘（tmpfs），/sbin/reboot 之后 /tmp/gdou-srun.log 等全部清空。
+#   于是「重启前到底发生了什么」永远查不到——而重启往往正是为了排障。
+#   这里在重启前把日志尾部抄到 /etc/gdou-srun/（overlay，掉电保留），
+#   重启后诊断包里就能看到「上一次运行」的日志。
+#
+# 用法： gdou-srun-reboot [手动|定时|失败恢复]
+
+set -u
+
+DIR=/etc/gdou-srun
+mkdir -p "$DIR" 2>/dev/null
+
+save() {
+	[ -f "$1" ] || return 0
+	tail -n 150 "$1" > "$2" 2>/dev/null || true
+}
+
+save /tmp/gdou-srun.log  "$DIR/prev-agent.log"
+save /tmp/gdou-dual.log  "$DIR/prev-dual.log"
+
+# 记录重启原因（持久化，能跨重启累积）
+printf '%s reboot reason=%s\n' \
+	"$(date '+%Y-%m-%d %H:%M:%S')" "${1:-manual}" >> "$DIR/events.log" 2>/dev/null || true
+
+# 事件日志限长，避免长年累积把 overlay 撑爆
+if [ -f "$DIR/events.log" ]; then
+	tail -n 300 "$DIR/events.log" > "$DIR/events.tmp" 2>/dev/null && mv "$DIR/events.tmp" "$DIR/events.log"
+fi
+
+sync
+
+# 测试用：GDOU_DRY_RUN=1 只做保存不重启
+if [ "${GDOU_DRY_RUN:-0}" = "1" ]; then
+	echo "dry-run: 已保存日志，跳过重启"
+	exit 0
+fi
+
+exec reboot

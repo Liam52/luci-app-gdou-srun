@@ -33,7 +33,8 @@ echo
 echo "--- 配置 ---"
 for k in enabled advanced dual_same_account split_mode mac_refresh mac_mode \
          interval login_cooldown server manual_acid last_good_acid acid \
-         renew_enable renew_times auto_apply ipv6; do
+         renew_enable renew_times reboot_enable reboot_times \
+         reboot_on_fail reboot_fail_threshold auto_apply ipv6_mode; do
 	printf '%-18s %s\n' "$k" "$(g $k)"
 done
 printf '%-18s %s\n' "username" "$(g username)"
@@ -171,6 +172,22 @@ else
 fi
 echo "开机自启 : $(/etc/init.d/gdou-srun enabled && echo 是 || echo 否)"
 echo "暂停标记 : $([ -f /tmp/gdou-srun.pause ] && echo 有（主链路被下线） || echo 无)"
+echo
+
+echo "--- 重启前记录（持久化，掉电保留）---"
+if [ -f /etc/gdou-srun/events.log ]; then
+	echo "事件记录（最近 15 条）:"
+	tail -n 15 /etc/gdou-srun/events.log | sed 's/^/  /'
+else
+	echo "（还没有持久记录）"
+fi
+echo
+if [ -f /etc/gdou-srun/prev-agent.log ]; then
+	echo "上次重启前的插件日志（最近 40 行）:"
+	tail -n 40 /etc/gdou-srun/prev-agent.log | cut -c1-160 | sed 's/^/  /'
+else
+	echo "（没有上次重启前的日志）"
+fi
 echo
 
 echo "--- 认证状态 ---"
