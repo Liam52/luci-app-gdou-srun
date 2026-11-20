@@ -35,6 +35,9 @@ CFG_EVERY = 5            # 配置重读周期
 PROBE_ONLINE = 10        # 在线时的探测间隔
 PROBE_OFFLINE = 3        # 离线时的探测间隔
 BACKOFF = [5, 10, 20, 40, 60]
+# 自动重启的安全边界：太频繁重启本身就是故障，宁可不动
+REBOOT_MIN_UPTIME = 3600      # 失败触发的重启，开机不足 1 小时不执行
+REBOOT_ON_FAIL_GAP = 3600     # 两次失败触发之间至少间隔 1 小时
 # 门户 BAS 类错误（限流/设备忙）单独用更长的退避，短时间重试只会加重限流
 BACKOFF_AC = [30, 60, 120, 300]
 
@@ -146,6 +149,63 @@ def load_auth():
 
 # ---------------------------------------------------------------- 链路活性
 
+PERSIST_DIR = "/etc/gdou-srun"
+PERSIST_EVENTS = PERSIST_DIR + "/events.log"
+REBOOT_HELPER = "/usr/libexec/gdou-srun-reboot"
+
+
+REBOOT_SLOT_FILE = PERSIST_DIR + "/last-reboot-slot"
+
+
+def read_reboot_slot():
+    """读取「本分钟已经重启过」的持久记录。
+
+    这个必须持久化：定时重启发生在 05:00，重启后开机仍可能落在 05:00 这一分钟内，
+    如果只记在内存里，就会再次触发重启 —— 实测 2026-11-20 05:00 连重启了 3 次。
+    """
+    try:
+        with open(REBOOT_SLOT_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def write_reboot_slot(slot):
+    try:
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+        with open(REBOOT_SLOT_FILE, "w", encoding="utf-8") as fh:
+            fh.write(slot)
+    except OSError:
+        pass
+
+
+def persist_event(text):
+    """把关键事件写进持久存储。
+
+    /tmp 是内存盘，重启即失；/etc 在 overlay 上，掉电也能保留。
+    只记录状态翻转、重启这类低频事件，避免写坏闪存。
+    """
+    try:
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+        with open(PERSIST_EVENTS, "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        with open(PERSIST_EVENTS, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        if len(lines) > 300:
+            with open(PERSIST_EVENTS, "w", encoding="utf-8") as fh:
+                fh.writelines(lines[-300:])
+    except OSError:
+        pass
+
+
+def read_uptime():
+    try:
+        with open("/proc/uptime") as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
 def rx_packets(dev="eth0"):
     try:
         with open("/sys/class/net/%s/statistics/rx_packets" % dev) as fh:
@@ -174,6 +234,10 @@ class Agent:
         self.renew_fail = 0
         self._bg = {}
         self.offline_since = 0
+        self.fail_streak = 0
+        self.last_reboot_slot = ""
+        self.reboot_uptime_noted = False
+        self.last_reboot_at = 0
 
     # ---------- 状态翻转 ----------
     def set_state(self, new, why=""):
@@ -183,6 +247,7 @@ class Agent:
         self.state = new
         if old != "unknown":
             log("state", **{"from": old, "to": new, "why": why})
+            persist_event("state %s -> %s%s" % (old, new, (" (%s)" % why) if why else ""))
         else:
             log("start", state=new)
 
@@ -212,6 +277,9 @@ class Agent:
                         ok, out, _ = run("gdou-srun-apply", timeout=120)
                         log("apply", ok=ok, out=out[-160:])
                 self.last_sig = sig
+
+        # 自动重启（定时 / 认证连续失败后）
+        self.maybe_reboot(cfg)
 
         # 周期性同步（多链路 / 分流 / IPv6）：这些脚本本身是幂等的
         if now - self.last_sync >= SYNC_EVERY:
@@ -271,10 +339,82 @@ class Agent:
             gap = cfg.get("renew_gap", "5")
             log("renew_start", at=hhmm, gap=gap)
             ok, out, err = run("gdou-srun", ["renew", str(gap)], timeout=150)
-            log("renew_done", ok=ok, detail=(out or err)[-200:])
+            detail = out or err
+            if '"skipped": true' in detail:
+                # 门户不健康，本次什么都没做（没有登出，网络保持原样）
+                log("renew_skipped", at=hhmm, why="门户前置探测失败")
+                return
+            log("renew_done", ok=ok, detail=detail[-200:])
             if not ok:
                 self.renew_fail += 1
                 log("renew_failed", count=self.renew_fail)
+
+    # ---------- 自动重启 ----------
+    def maybe_reboot(self, cfg):
+        """两种触发：定时重启、认证连续失败后重启。
+
+        失败触发的重启是「端口被校园网禁用」的兜底——重启会重新协商链路，
+        实测能把被 err-disable 的端口救回来。但重启是重手段，加了两道闸：
+        开机不足 1 小时不重启、两次失败触发至少间隔 1 小时，避免重启循环。
+        """
+        now = time.time()
+
+        # ① 定时重启
+        if cfg.get("reboot_enable") == "1":
+            times = (cfg.get("reboot_times") or "").replace(",", " ").split()
+            if times:
+                lt = time.localtime()
+                hhmm = "%02d%02d" % (lt.tm_hour, lt.tm_min)
+                slot = time.strftime("%Y%m%d") + hhmm
+                if hhmm in times and slot != self.last_reboot_slot:
+                    # 保护1：持久记录说这一分钟已经重启过，就不再来一次
+                    if read_reboot_slot() == slot:
+                        self.last_reboot_slot = slot
+                        return
+                    # 保护2：开机不足 10 分钟不执行定时重启（防止重启循环）
+                    if read_uptime() < 600:
+                        if not self.reboot_uptime_noted:
+                            self.reboot_uptime_noted = True
+                            log("reboot_skip", why="开机不足 10 分钟，跳过定时重启")
+                        return
+                    self.last_reboot_slot = slot
+                    write_reboot_slot(slot)
+                    self.do_reboot("定时重启 %s" % hhmm)
+
+        # ② 认证连续失败
+        if cfg.get("reboot_on_fail") == "1":
+            try:
+                threshold = int(cfg.get("reboot_fail_threshold") or 20)
+            except (TypeError, ValueError):
+                threshold = 20
+            if threshold < 3:
+                threshold = 3
+            if self.fail_streak >= threshold:
+                uptime = read_uptime()
+                if uptime < REBOOT_MIN_UPTIME:
+                    if self.fail_streak == threshold:
+                        log("reboot_skip", why="开机不足 1 小时", uptime=int(uptime))
+                elif now - self.last_reboot_at < REBOOT_ON_FAIL_GAP:
+                    if self.fail_streak == threshold:
+                        log("reboot_skip", why="距上次自动重启不足 1 小时")
+                else:
+                    self.last_reboot_at = now
+                    self.do_reboot("认证连续失败 %d 次" % self.fail_streak)
+
+    def do_reboot(self, why):
+        log("reboot", why=why)
+        persist_event("reboot requested: %s" % why)
+        time.sleep(1)
+        try:
+            # 走助手脚本：它会先把日志抄到 /etc/gdou-srun/ 再重启，
+            # 否则重启后 /tmp 里的日志全没了，事后查不到为什么重启。
+            subprocess.run([REBOOT_HELPER, why], timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            log("reboot_failed", msg=str(exc)[:120])
+            try:
+                subprocess.run(["/sbin/reboot"], timeout=10)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---------- 离线时该做的事 ----------
     def after_offline(self, cfg):
@@ -336,6 +476,7 @@ class Agent:
             log("login_ok", detail=detail)
             self.backoff_idx = 0
             self.next_login = 0
+            self.fail_streak = 0
             self.set_state("online", "登录成功")
         else:
             # 区分「网络不通」和「门户 BAS 限流」：后者要退得更久
@@ -343,6 +484,7 @@ class Agent:
             table = BACKOFF_AC if ac_fail else BACKOFF
             wait = table[min(self.backoff_idx, len(table) - 1)]
             self.backoff_idx += 1
+            self.fail_streak += 1
             self.next_login = time.time() + wait
             if ac_fail:
                 log("login_throttled", detail=detail[-160:], retry_in=wait,
@@ -448,7 +590,8 @@ class Agent:
 
     # ---------- 启动 ----------
     def run_forever(self):
-        log("boot", version="3.1.0-agent", pid=os.getpid())
+        log("boot", version="3.2.1-agent", pid=os.getpid())
+        persist_event("boot pid=%d" % os.getpid())
         while True:
             try:
                 self.tick()

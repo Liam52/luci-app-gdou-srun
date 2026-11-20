@@ -31,10 +31,11 @@ usr/libexec/gdou-srun-split
 usr/libexec/gdou-srun-status
 usr/libexec/gdou-srun-diag
 usr/libexec/gdou-srun-agent
+usr/libexec/gdou-srun-reboot
 usr/share/luci/menu.d/luci-app-gdou-srun.json
 usr/share/rpcd/acl.d/luci-app-gdou-srun.json
 www/luci-static/resources/gdou-srun/ui.css
-www/luci-static/resources/view/gdou-srun/home.js
+www/luci-static/resources/view/gdou-srun/dashboard.js
 www/luci-static/resources/view/gdou-srun/settings.js
 www/luci-static/resources/view/gdou-srun/advanced.js
 "

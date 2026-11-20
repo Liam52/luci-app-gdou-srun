@@ -594,8 +594,30 @@ def do_logout(cfg):
 
 
 # ---------------- 定时重连 ----------------
+def portal_ready(cfg, timeout=6):
+    """登录前置检查：门户的 challenge 接口是否正常。
+
+    定时重连是「先登出再登录」。一旦登出成功而登录失败，就等于主动把
+    好好的网络弄断。实测 2026-11-19 20:00：学校第三方认证（third_auth）
+    超时，登出成功、登录连续失败，断网 2.5 分钟。
+    所以动手之前先问一句「门户健康吗」，不健康就什么都不做。
+    """
+    try:
+        server = (cfg.get("server") or "http://10.129.1.1").rstrip("/")
+        data = get_challenge(server, cfg.get("username") or "", timeout)
+        return bool(data.get("challenge"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def do_renew(cfg, gap=5):
-    """下线，等待若干秒，再重新登录。用于定时刷新会话。"""
+    """下线，等待若干秒，再重新登录。用于定时刷新会话。
+
+    两道保护：
+    1. 动手前探测门户，不健康就跳过——避免把好好的网络弄断；
+    2. 登录失败立即重试（最多 3 次）——此时会话已经被登出，
+       拖到下一个定时点可能断网几小时。
+    """
     try:
         gap = int(gap)
     except (TypeError, ValueError):
@@ -603,6 +625,14 @@ def do_renew(cfg, gap=5):
     gap = max(0, min(60, gap))
 
     out = {"gap": gap}
+
+    if not portal_ready(cfg):
+        out["ok"] = False
+        out["skipped"] = True
+        out["kind"] = "portal_unhealthy"
+        out["msg"] = "门户前置探测失败，本次跳过重连（避免主动断网）"
+        return out
+
     try:
         out["logout"] = do_logout(cfg)
     except Exception as exc:  # noqa: BLE001
@@ -611,12 +641,22 @@ def do_renew(cfg, gap=5):
     if gap:
         time.sleep(gap)
 
-    try:
-        out["login"] = do_login(cfg)
-    except Exception as exc:  # noqa: BLE001
-        out["login"] = {"ok": False, "kind": "network", "msg": str(exc)}
+    login = None
+    attempts = 0
+    for attempt in range(3):
+        attempts = attempt + 1
+        try:
+            login = do_login(cfg)
+        except Exception as exc:  # noqa: BLE001
+            login = {"ok": False, "kind": "network", "msg": str(exc)}
+        if login.get("ok"):
+            break
+        if attempt < 2:
+            time.sleep(5)
 
-    out["ok"] = bool((out.get("login") or {}).get("ok"))
+    out["login"] = login
+    out["attempts"] = attempts
+    out["ok"] = bool((login or {}).get("ok"))
     return out
 
 

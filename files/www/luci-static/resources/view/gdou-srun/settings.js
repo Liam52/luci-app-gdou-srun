@@ -156,6 +156,32 @@ return view.extend({
 		o.default = '5';
 		o.datatype = 'range(2,60)';
 
+		/* ---------------- 自动重启 ---------------- */
+		title('自动重启');
+
+		o = s.option(form.Flag, 'reboot_enable', '启用定时重启',
+			'每天到点自动重启路由器，清理内存和网络状态。');
+		o.default = '0';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'reboot_times', '重启时刻',
+			'24 小时制 4 位数字，可填多个，空格或逗号分隔。');
+		o.default = '0400';
+		o.placeholder = '0400';
+		o.rmempty = false;
+		o.validate = timesValidate;
+
+		o = s.option(form.Flag, 'reboot_on_fail', '认证连续失败后自动重启',
+			'连续失败达到阈值时重启，用于把被校园网禁用的端口救回来（重启会重新协商链路）。' +
+			'内置保护：开机不足 1 小时不执行、两次之间至少间隔 1 小时，不会反复重启。');
+		o.default = '0';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'reboot_fail_threshold', '失败次数阈值',
+			'连续失败多少次后重启。太小没有意义（网络抖动也会失败几次），建议 15~30。');
+		o.default = '20';
+		o.datatype = 'range(3,200)';
+
 		/* ---------------- MAC 地址 ---------------- */
 		title('MAC 地址');
 
@@ -249,7 +275,8 @@ return view.extend({
 			'<button class="btn cbi-button cbi-button-apply" data-gd-act="apply">立即重连</button> ' +
 			'<button class="btn cbi-button" data-gd-act="mac">刷新 MAC</button> ' +
 			'<button class="btn cbi-button" data-gd-act="macrestore">恢复原始 MAC</button> ' +
-			'<button class="btn cbi-button" data-gd-act="macpool">重建 MAC 池</button>' +
+			'<button class="btn cbi-button" data-gd-act="macpool">重建 MAC 池</button> ' +
+			'<button class="btn cbi-button" data-gd-act="reboot">立即重启</button>' +
 			'</div>' +
 			'<pre id="gdou-act-result" style="white-space:pre-wrap;font-size:12px;margin:0"></pre>';
 
@@ -306,6 +333,30 @@ return view.extend({
 			Array.prototype.forEach.call(buttons, function (btn) {
 				btn.addEventListener('click', function () {
 					var act = btn.getAttribute('data-gd-act');
+
+					/* 重启单独处理：指令发出后连接就断了，不能走普通的「执行并显示输出」流程 */
+					if (act === 'reboot') {
+						var okRb = window.confirm(
+							'确定要重启路由器吗？\n\n' +
+							'· 全屋断网约 40~60 秒\n' +
+							'· 正在下载/传输的文件会中断\n' +
+							'· 重启后插件会自动认证\n\n' +
+							'（只是认证掉了用「立即重连」就够，不必重启）');
+						if (!okRb) return;
+						btn.disabled = true;
+						btn.textContent = '正在重启…';
+						fs.exec('/usr/libexec/gdou-srun-reboot', ['manual']).then(function () {
+						}).catch(function () {
+						}).finally(function () {
+							var outRb = node.querySelector('#gdou-act-result');
+							if (outRb) {
+								outRb.style.color = '#c77800';
+								outRb.textContent = '重启指令已发送，约 40~60 秒后可重新访问。';
+							}
+						});
+						return;
+					}
+
 					var script = '/usr/libexec/gdou-srun';
 					var args = [ act ];
 
